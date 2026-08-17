@@ -1,5 +1,10 @@
+const fs = require('fs');
+const path = require('path');
+const ical = require('node-ical');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+require('dotenv').config({ path: path.join(__dirname, '.env.local') });
+
 const { createClient } = require('@supabase/supabase-js');
-require('dotenv').config();
 
 const SUPABASE_URL =
   process.env.SUPABASE_URL ||
@@ -9,424 +14,274 @@ const SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   process.env.SUPABASE_KEY;
 
-const PROJECT_ID = 'teslacam-93532';
-const VEHICLE_ID = '3744141651867089';
-const USER_UID =
-  process.env.USER_UID ||
-  'dwHcQZWCzBSzmJx8Q5qNkZjAH6d2';
+const GOOGLE_CALENDAR_ICS_URL =
+  process.env.GOOGLE_CALENDAR_ICS_URL;
 
 const KAKAO_REST_API_KEY =
   process.env.KAKAO_REST_API_KEY ||
   process.env.KAKAO_API_KEY;
 
-const TIMEOUT_MS = 10000;
-const MAX_PAGES = 3;
-const PAGE_SIZE = 50;
+const VEHICLE_ID = '3744141651867089';
 
+const USER_UID =
+  process.env.USER_UID ||
+  'dwHcQZWCzBSzmJx8Q5qNkZjAH6d2';
 
-// ============================================================
-// ⏱️ Timeout
-// ============================================================
-
-async function withTimeout(promise, ms = TIMEOUT_MS) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`Timeout after ${ms}ms`)),
-        ms
-      )
-    )
-  ]);
-}
-
+const PROJECT_ID = 'teslacam-93532';
 
 // ============================================================
-// 🔑 Google ID Token
+// 중복 운행 판정 기준
 // ============================================================
 
-async function getGoogleIdToken() {
-  if (
-    !process.env.GOOGLE_API_KEY ||
-    !process.env.GOOGLE_REFRESH_TOKEN
-  ) {
-    return null;
-  }
+const DRIVING_DEDUP_WINDOW_MS = 5 * 60 * 1000;
+const DRIVING_DEDUP_DISTANCE_KM = 0.5;
+const MIN_DRIVING_DISTANCE_KM = 0.05;
+
+// ============================================================
+// GeoJSON
+// ============================================================
+
+let geojsonCache = null;
+
+function loadGeoJson() {
+  if (geojsonCache) return geojsonCache;
 
   try {
-    const res = await fetch(
-      `https://securetoken.googleapis.com/v1/token?key=${process.env.GOOGLE_API_KEY}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type':
-            'application/x-www-form-urlencoded'
-        },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token:
-            process.env.GOOGLE_REFRESH_TOKEN
-        })
-      }
+    const filePath = path.join(__dirname, 'hangjungdong.json');
+    const parentFilePath = path.join(
+      __dirname,
+      '..',
+      'hangjungdong.json'
     );
 
-    const data = await res.json();
+    let targetPath = null;
 
-    if (!res.ok || !data.id_token) {
-      console.error(
-        '[Google Auth] 토큰 갱신 실패:',
-        data.error || 'unknown error'
-      );
-      return null;
+    if (fs.existsSync(filePath)) {
+      targetPath = filePath;
+    } else if (fs.existsSync(parentFilePath)) {
+      targetPath = parentFilePath;
     }
 
-    return data.id_token;
-
+    if (targetPath) {
+      const raw = fs.readFileSync(targetPath, 'utf8');
+      geojsonCache = JSON.parse(raw);
+    }
   } catch (e) {
     console.error(
-      '[Google Auth] 예외:',
+      'GeoJSON 로드 실패:',
       e.message
     );
-    return null;
   }
+
+  return geojsonCache;
 }
 
+function isPointInPolygon(point, vs) {
+  if (!vs || !Array.isArray(vs)) return false;
 
-// ============================================================
-// 📊 마지막 Supabase 기록 시간
-// ============================================================
+  const x = point[0];
+  const y = point[1];
 
-async function getLastRecordTimestamps(supabase) {
-  const result = {
-    driving: null,
-    vehicle: null,
-    charging: null
-  };
+  let inside = false;
+
+  for (
+    let i = 0, j = vs.length - 1;
+    i < vs.length;
+    j = i++
+  ) {
+    const xi = vs[i][0];
+    const yi = vs[i][1];
+
+    const xj = vs[j][0];
+    const yj = vs[j][1];
+
+    const intersect =
+      ((yi > y) !== (yj > y)) &&
+      (
+        x <
+        ((xj - xi) * (y - yi)) /
+          (yj - yi) +
+          xi
+      );
+
+    if (intersect) {
+      inside = !inside;
+    }
+  }
+
+  return inside;
+}
+
+function getDongFromCoords(lat, lng) {
+  const geojson = loadGeoJson();
+
+  if (
+    !lat ||
+    !lng ||
+    isNaN(lat) ||
+    isNaN(lng) ||
+    !geojson
+  ) {
+    return '';
+  }
+
+  const pt = [
+    Number(lng),
+    Number(lat)
+  ];
 
   try {
+    for (const feature of geojson.features || []) {
+      const geom = feature.geometry;
 
-    const { data: d } = await supabase
-      .from('driving')
-      .select('created_at')
-      .order('created_at', {
-        ascending: false
-      })
-      .limit(1);
+      if (!geom) continue;
 
-    if (d?.length && d[0].created_at) {
-      result.driving =
-        new Date(d[0].created_at);
+      const props = feature.properties || {};
+
+      let fullAddr =
+        props.adm_nm ||
+        props.full_name ||
+        '';
+
+      if (!fullAddr) {
+        const sido =
+          props.sidonm ||
+          props.sido ||
+          '';
+
+        const sgg =
+          props.sggnm ||
+          props.sgg ||
+          '';
+
+        const emd =
+          props.emdnm ||
+          props.emd ||
+          '';
+
+        fullAddr =
+          `${sido} ${sgg} ${emd}`.trim();
+      }
+
+      if (
+        geom.type === 'Polygon' &&
+        geom.coordinates &&
+        geom.coordinates[0]
+      ) {
+        if (
+          isPointInPolygon(
+            pt,
+            geom.coordinates[0]
+          )
+        ) {
+          return cleanAddressText(fullAddr);
+        }
+      } else if (
+        geom.type === 'MultiPolygon' &&
+        geom.coordinates
+      ) {
+        for (const poly of geom.coordinates) {
+          if (
+            poly &&
+            poly[0] &&
+            isPointInPolygon(
+              pt,
+              poly[0]
+            )
+          ) {
+            return cleanAddressText(fullAddr);
+          }
+        }
+      }
     }
-
-
-    const { data: v } = await supabase
-      .from('vehicle')
-      .select('updated_at')
-      .order('updated_at', {
-        ascending: false
-      })
-      .limit(1);
-
-    if (v?.length && v[0].updated_at) {
-      result.vehicle =
-        new Date(v[0].updated_at);
-    }
-
-
-    const { data: c } = await supabase
-      .from('charging')
-      .select('created_at')
-      .order('created_at', {
-        ascending: false
-      })
-      .limit(1);
-
-    if (c?.length && c[0].created_at) {
-      result.charging =
-        new Date(c[0].created_at);
-    }
-
   } catch (e) {
-    console.warn(
-      '[Supabase] 마지막 기록 시간 조회 실패:',
+    console.error(
+      '행정동 주소 변환 오류:',
       e.message
     );
   }
 
-  return result;
+  return '';
 }
 
+function cleanAddressText(addr) {
+  if (!addr) return '';
 
-// ============================================================
-// 🔥 Firestore 전체/부분 조회
-// ============================================================
-
-async function fetchFirestoreDocsSince(
-  collection,
-  token,
-  sinceDate
-) {
-
-  let allDocs = [];
-  let pageToken = null;
-  let pageNum = 0;
-
-  const sinceTimestamp =
-    sinceDate
-      ? sinceDate.getTime()
-      : 0;
-
-  while (pageNum < MAX_PAGES) {
-
-    pageNum++;
-
-    let url =
-      `https://firestore.googleapis.com/v1/projects/` +
-      `${PROJECT_ID}/databases/(default)/documents/` +
-      `vehicle/${VEHICLE_ID}/${collection}`;
-
-    const params =
-      new URLSearchParams({
-        pageSize: PAGE_SIZE
-      });
-
-    if (pageToken) {
-      params.append(
-        'pageToken',
-        pageToken
-      );
-    }
-
-    url += '?' + params.toString();
-
-    const res = await fetch(
-      url,
-      {
-        headers: {
-          Authorization:
-            `Bearer ${token}`
-        }
-      }
-    );
-
-    if (!res.ok) {
-
-      const errBody =
-        await res.text().catch(() => '');
-
-      throw new Error(
-        `Firestore error ${res.status}: ${errBody}`
-      );
-    }
-
-    const data =
-      await res.json();
-
-    const docs =
-      data.documents || [];
-
-    console.log(
-      `  [${collection}] 페이지 ${pageNum}: ` +
-      `${docs.length}개 수신`
-    );
-
-    const filtered =
-      docs.filter(doc => {
-
-        const fields =
-          doc.fields || {};
-
-        const dateValue =
-          fields.date?.integerValue ??
-          fields.date?.doubleValue ??
-          null;
-
-        if (dateValue !== null) {
-
-          const timestamp =
-            Number(dateValue);
-
-          return (
-            !isNaN(timestamp) &&
-            timestamp >= sinceTimestamp
-          );
-        }
-
-        // date 필드가 없으면 일단 포함
-        return true;
-      });
-
-    allDocs.push(...filtered);
-
-    pageToken =
-      data.nextPageToken || null;
-
-    if (!pageToken) {
-      break;
-    }
-
-    await new Promise(
-      r => setTimeout(r, 50)
-    );
-  }
-
-  return allDocs;
+  return addr
+    .replace(/^서울특별시\s*/, '')
+    .replace(/^경기도\s*/, '')
+    .replace(/고양시\s*/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-
 // ============================================================
-// 🔄 Firestore 값 파싱
+// Firestore 파싱
 // ============================================================
 
-function parseFirestoreValue(v) {
+function parseFirestoreValue(valObj) {
+  if (!valObj) return null;
 
-  if (!v) return null;
-
-  if (v.stringValue !== undefined) {
-    return v.stringValue;
+  if (valObj.stringValue !== undefined) {
+    return valObj.stringValue;
   }
 
-  if (v.integerValue !== undefined) {
-    return Number(v.integerValue);
+  if (valObj.integerValue !== undefined) {
+    return Number(valObj.integerValue);
   }
 
-  if (v.doubleValue !== undefined) {
-    return Number(v.doubleValue);
+  if (valObj.doubleValue !== undefined) {
+    return Number(valObj.doubleValue);
   }
 
-  if (v.booleanValue !== undefined) {
-    return v.booleanValue;
+  if (valObj.booleanValue !== undefined) {
+    return valObj.booleanValue;
   }
 
-  if (v.timestampValue !== undefined) {
-    return v.timestampValue;
+  if (valObj.timestampValue !== undefined) {
+    return valObj.timestampValue;
   }
 
-  if (v.nullValue !== undefined) {
+  if (valObj.nullValue !== undefined) {
     return null;
   }
 
-  if (v.mapValue) {
+  if (valObj.mapValue) {
     return parseFirestoreFields(
-      v.mapValue.fields || {}
+      valObj.mapValue.fields || {}
     );
   }
 
-  if (v.arrayValue) {
-    return (
-      v.arrayValue.values || []
-    ).map(item =>
-      parseFirestoreValue(item)
+  if (valObj.arrayValue) {
+    const list =
+      valObj.arrayValue.values || [];
+
+    return list.map(v =>
+      parseFirestoreValue(v)
     );
   }
 
   return null;
 }
 
-
 function parseFirestoreFields(fields) {
-
   if (!fields) return {};
 
   const result = {};
 
   for (const key in fields) {
     result[key] =
-      parseFirestoreValue(
-        fields[key]
-      );
+      parseFirestoreValue(fields[key]);
   }
 
   return result;
 }
 
-
 // ============================================================
-// ⏱️ 날짜 안전 변환
-// ============================================================
-
-function safeToISOString(
-  value,
-  fallback = null
-) {
-
-  if (
-    value === undefined ||
-    value === null ||
-    value === ''
-  ) {
-    return fallback;
-  }
-
-  try {
-
-    if (
-      typeof value === 'number' &&
-      isFinite(value)
-    ) {
-
-      let ms = value;
-
-      // Unix seconds
-      if (Math.abs(ms) < 100000000000) {
-        ms *= 1000;
-      }
-
-      const d = new Date(ms);
-
-      if (!isNaN(d.getTime())) {
-        return d.toISOString();
-      }
-    }
-
-
-    if (typeof value === 'string') {
-
-      const trimmed =
-        value.trim();
-
-      if (!trimmed) {
-        return fallback;
-      }
-
-      // 숫자로 저장된 timestamp
-      if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
-
-        let num =
-          Number(trimmed);
-
-        if (Math.abs(num) < 100000000000) {
-          num *= 1000;
-        }
-
-        const d =
-          new Date(num);
-
-        if (!isNaN(d.getTime())) {
-          return d.toISOString();
-        }
-      }
-
-      const d =
-        new Date(trimmed);
-
-      if (!isNaN(d.getTime())) {
-        return d.toISOString();
-      }
-    }
-
-  } catch (e) {}
-
-  return fallback;
-}
-
-
-// ============================================================
-// ⏱️ 운행시간 문자열/숫자 파싱
+// 시간 파싱
 // ============================================================
 
 function parseDrivingTimeToMinutes(rawVal) {
-
   if (
     rawVal === undefined ||
     rawVal === null
@@ -435,18 +290,14 @@ function parseDrivingTimeToMinutes(rawVal) {
   }
 
   if (typeof rawVal === 'number') {
-
-    if (!isFinite(rawVal)) {
+    if (!Number.isFinite(rawVal)) {
       return 0;
     }
 
     return Math.round(rawVal);
   }
 
-  const str =
-    String(rawVal).trim();
-
-  if (!str) return 0;
+  const str = String(rawVal).trim();
 
   let hours = 0;
   let mins = 0;
@@ -473,7 +324,10 @@ function parseDrivingTimeToMinutes(rawVal) {
       );
   }
 
-  if (hourMatch || minMatch) {
+  if (
+    hourMatch ||
+    minMatch
+  ) {
     return hours * 60 + mins;
   }
 
@@ -487,1552 +341,1379 @@ function parseDrivingTimeToMinutes(rawVal) {
   return 0;
 }
 
-
-// ============================================================
-// 🔥 실제 start_time/end_time 기반 운행시간 계산
-// ============================================================
-
-function calculateDurationMinutes(
-  startTime,
-  endTime,
-  fallback = 0
+function safeToISOString(
+  val,
+  fallback = null
 ) {
+  if (!val) return fallback;
 
-  if (
-    !startTime ||
-    !endTime
-  ) {
-    return fallback;
-  }
+  try {
+    if (typeof val === 'number') {
+      const d = new Date(val);
 
-  const start =
-    new Date(startTime).getTime();
+      if (!isNaN(d.getTime())) {
+        return d.toISOString();
+      }
+    }
 
-  const end =
-    new Date(endTime).getTime();
+    if (typeof val === 'string') {
+      const num = Number(val);
 
-  if (
-    !isFinite(start) ||
-    !isFinite(end) ||
-    end <= start
-  ) {
-    return fallback;
-  }
+      if (
+        !isNaN(num) &&
+        val.trim() !== ''
+      ) {
+        const d = new Date(num);
 
-  return Math.round(
-    (end - start) / 60000
-  );
-}
-
-
-// ============================================================
-// 📦 Supabase Upsert
-// ============================================================
-
-async function upsertWithRetry(
-  supabase,
-  table,
-  records,
-  maxRetries = 2
-) {
-
-  const CHUNK = 20;
-  let saved = 0;
-
-  for (
-    let i = 0;
-    i < records.length;
-    i += CHUNK
-  ) {
-
-    const chunk =
-      records.slice(
-        i,
-        i + CHUNK
-      );
-
-    let attempt = 0;
-    let ok = false;
-
-    while (
-      !ok &&
-      attempt < maxRetries
-    ) {
-
-      attempt++;
-
-      try {
-
-        const { error } =
-          await supabase
-            .from(table)
-            .upsert(
-              chunk,
-              {
-                onConflict: 'id'
-              }
-            );
-
-        if (error) {
-          throw error;
-        }
-
-        saved +=
-          chunk.length;
-
-        ok = true;
-
-      } catch (e) {
-
-        console.warn(
-          `⚠️ [${table}] 저장 실패 ` +
-          `${attempt}/${maxRetries}: ` +
-          `${e.message}`
-        );
-
-        if (
-          attempt < maxRetries
-        ) {
-          await new Promise(
-            r => setTimeout(
-              r,
-              1000
-            )
-          );
+        if (!isNaN(d.getTime())) {
+          return d.toISOString();
         }
       }
+
+      const d = new Date(val);
+
+      if (!isNaN(d.getTime())) {
+        return d.toISOString();
+      }
+    }
+  } catch (e) {}
+
+  return fallback;
+}
+
+// ============================================================
+// 운행 시간 계산
+//
+// 가장 중요한 부분:
+// Firestore의 duration 값보다
+// start_time → end_time 차이를 우선 사용한다.
+// ============================================================
+
+function calculateDrivingDuration(
+  startISO,
+  endISO,
+  rawDuration
+) {
+  if (
+    startISO &&
+    endISO
+  ) {
+    const startMs =
+      new Date(startISO).getTime();
+
+    const endMs =
+      new Date(endISO).getTime();
+
+    if (
+      Number.isFinite(startMs) &&
+      Number.isFinite(endMs) &&
+      endMs > startMs
+    ) {
+      return Math.round(
+        (endMs - startMs) / 60000
+      );
     }
   }
 
-  return saved;
+  return parseDrivingTimeToMinutes(
+    rawDuration
+  );
 }
 
-
 // ============================================================
-// 📍 Kakao API
+// Google ID Token
 // ============================================================
 
-async function callKakaoLocalApi(
-  endpoint,
-  query,
-  apiKey
-) {
-
-  const encoded =
-    encodeURIComponent(query);
-
-  const url =
-    `https://dapi.kakao.com/v2/local/search/` +
-    `${endpoint}.json?query=${encoded}`;
-
-  const res =
-    await fetch(
-      url,
-      {
-        headers: {
-          Authorization:
-            `KakaoAK ${apiKey}`
-        }
-      }
-    );
-
-  if (!res.ok) {
+async function getGoogleIdToken() {
+  if (
+    !process.env.GOOGLE_API_KEY ||
+    !process.env.GOOGLE_REFRESH_TOKEN
+  ) {
     return null;
   }
 
-  const data =
-    await res.json();
+  try {
+    const res = await fetch(
+      `https://securetoken.googleapis.com/v1/token?key=${process.env.GOOGLE_API_KEY}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type':
+            'application/x-www-form-urlencoded'
+        },
+        body: new URLSearchParams({
+          grant_type:
+            'refresh_token',
+          refresh_token:
+            process.env.GOOGLE_REFRESH_TOKEN
+        })
+      }
+    );
 
-  if (
-    data.documents &&
-    data.documents.length > 0
-  ) {
-
-    const doc =
-      data.documents[0];
-
-    const lat =
-      parseFloat(doc.y);
-
-    const lng =
-      parseFloat(doc.x);
+    const data =
+      await res.json();
 
     if (
-      !isNaN(lat) &&
-      !isNaN(lng) &&
-      lat !== 0 &&
-      lng !== 0
+      !res.ok ||
+      !data.id_token
     ) {
-      return {
-        lat,
-        lng
-      };
+      console.error(
+        '[Google Auth] 토큰 갱신 실패:',
+        data.error,
+        '-',
+        data.error_description
+      );
+
+      return null;
+    }
+
+    return data.id_token;
+  } catch (e) {
+    console.error(
+      '[Google Auth] 예외:',
+      e.message
+    );
+
+    return null;
+  }
+}
+
+// ============================================================
+// Supabase 기존 ID 조회
+// ============================================================
+
+async function fetchExistingIds(
+  supabase,
+  tableName
+) {
+  const ids = new Set();
+
+  const PAGE = 1000;
+  let from = 0;
+
+  try {
+    while (true) {
+      const {
+        data,
+        error
+      } = await supabase
+        .from(tableName)
+        .select('id')
+        .range(
+          from,
+          from + PAGE - 1
+        );
+
+      if (
+        error ||
+        !data ||
+        data.length === 0
+      ) {
+        break;
+      }
+
+      data.forEach(row => {
+        if (row.id) {
+          ids.add(row.id);
+        }
+      });
+
+      if (data.length < PAGE) {
+        break;
+      }
+
+      from += PAGE;
+    }
+  } catch (e) {
+    console.warn(
+      `[${tableName}] 기존 ID 조회 실패:`,
+      e.message
+    );
+  }
+
+  return ids;
+}
+
+// ============================================================
+// 기존 driving 데이터
+// ============================================================
+
+async function fetchExistingDrivingRows(
+  supabase
+) {
+  const rows = [];
+
+  const PAGE = 1000;
+  let from = 0;
+
+  try {
+    while (true) {
+      const {
+        data,
+        error
+      } = await supabase
+        .from('driving')
+        .select(
+          [
+            'id',
+            'vehicle_id',
+            'distance_km',
+            'move_km',
+            'start_time',
+            'end_time',
+            'duration_min',
+            'driving_time'
+          ].join(',')
+        )
+        .range(
+          from,
+          from + PAGE - 1
+        );
+
+      if (error) {
+        console.warn(
+          '기존 driving 조회 실패:',
+          error.message
+        );
+        break;
+      }
+
+      if (
+        !data ||
+        data.length === 0
+      ) {
+        break;
+      }
+
+      rows.push(...data);
+
+      if (data.length < PAGE) {
+        break;
+      }
+
+      from += PAGE;
+    }
+  } catch (e) {
+    console.warn(
+      '기존 driving 조회 예외:',
+      e.message
+    );
+  }
+
+  return rows;
+}
+
+// ============================================================
+// driving 중복 검사
+//
+// 조건:
+// 1. 같은 차량
+// 2. start_time 차이 <= 5분
+// 3. 거리 차이 < 0.5km
+//
+// 텍스트(start_dong 등)는 비교하지 않는다.
+// ============================================================
+
+function findDrivingDuplicate(
+  existingRows,
+  newRecord
+) {
+  if (
+    !newRecord ||
+    !newRecord.start_time
+  ) {
+    return null;
+  }
+
+  const newStartMs =
+    new Date(
+      newRecord.start_time
+    ).getTime();
+
+  if (!Number.isFinite(newStartMs)) {
+    return null;
+  }
+
+  const newDistance =
+    Number(
+      newRecord.distance_km ??
+      newRecord.move_km ??
+      0
+    );
+
+  for (const row of existingRows) {
+    if (
+      row.vehicle_id &&
+      newRecord.vehicle_id &&
+      String(row.vehicle_id) !==
+        String(newRecord.vehicle_id)
+    ) {
+      continue;
+    }
+
+    if (!row.start_time) {
+      continue;
+    }
+
+    const existingStartMs =
+      new Date(
+        row.start_time
+      ).getTime();
+
+    if (
+      !Number.isFinite(
+        existingStartMs
+      )
+    ) {
+      continue;
+    }
+
+    const timeDiff =
+      Math.abs(
+        existingStartMs -
+        newStartMs
+      );
+
+    if (
+      timeDiff >
+      DRIVING_DEDUP_WINDOW_MS
+    ) {
+      continue;
+    }
+
+    const existingDistance =
+      Number(
+        row.distance_km ??
+        row.move_km ??
+        0
+      );
+
+    const distanceDiff =
+      Math.abs(
+        existingDistance -
+        newDistance
+      );
+
+    if (
+      distanceDiff <
+      DRIVING_DEDUP_DISTANCE_KM
+    ) {
+      return row;
     }
   }
 
   return null;
 }
 
+// ============================================================
+// batch 내부 driving 중복 검사
+// ============================================================
 
-async function geocodeAddressKakao(
-  rawLocation
+function findBatchDrivingDuplicate(
+  batch,
+  newRecord
 ) {
-
   if (
-    !rawLocation ||
-    typeof rawLocation !== 'string'
+    !newRecord ||
+    !newRecord.start_time
   ) {
-    return {
-      lat: null,
-      lng: null
-    };
+    return -1;
   }
 
-  const trimmed =
-    rawLocation.trim();
+  const newStartMs =
+    new Date(
+      newRecord.start_time
+    ).getTime();
 
-  if (trimmed.length < 3) {
-    return {
-      lat: null,
-      lng: null
-    };
+  if (!Number.isFinite(newStartMs)) {
+    return -1;
   }
 
-  const apiKey =
-    KAKAO_REST_API_KEY;
-
-  if (!apiKey) {
-    return {
-      lat: null,
-      lng: null
-    };
-  }
-
-  const match =
-    trimmed.match(
-      /^(.*?)\(([^)]+)\)\s*$/
+  const newDistance =
+    Number(
+      newRecord.distance_km ??
+      newRecord.move_km ??
+      0
     );
 
-  const placeName =
-    match
-      ? match[1].trim()
-      : null;
-
-  const addressPart =
-    match
-      ? match[2].trim()
-      : null;
-
-  try {
-
-    if (addressPart) {
-
-      const hit =
-        await callKakaoLocalApi(
-          'address',
-          addressPart,
-          apiKey
-        );
-
-      if (hit) return hit;
-
-      await new Promise(
-        r => setTimeout(r, 120)
-      );
+  return batch.findIndex(item => {
+    if (!item.start_time) {
+      return false;
     }
 
+    const itemStartMs =
+      new Date(
+        item.start_time
+      ).getTime();
 
     if (
-      placeName &&
-      placeName.length >= 2
+      !Number.isFinite(
+        itemStartMs
+      )
     ) {
-
-      const hit =
-        await callKakaoLocalApi(
-          'keyword',
-          placeName,
-          apiKey
-        );
-
-      if (hit) return hit;
-
-      await new Promise(
-        r => setTimeout(r, 120)
-      );
+      return false;
     }
 
-
-    if (addressPart) {
-
-      const hit =
-        await callKakaoLocalApi(
-          'keyword',
-          addressPart,
-          apiKey
-        );
-
-      if (hit) return hit;
-
-      await new Promise(
-        r => setTimeout(r, 120)
+    const timeDiff =
+      Math.abs(
+        itemStartMs -
+        newStartMs
       );
+
+    if (
+      timeDiff >
+      DRIVING_DEDUP_WINDOW_MS
+    ) {
+      return false;
     }
 
-
-    const hit =
-      await callKakaoLocalApi(
-        'keyword',
-        trimmed,
-        apiKey
+    const itemDistance =
+      Number(
+        item.distance_km ??
+        item.move_km ??
+        0
       );
 
-    if (hit) return hit;
+    const distanceDiff =
+      Math.abs(
+        itemDistance -
+        newDistance
+      );
 
-  } catch (e) {}
-
-  return {
-    lat: null,
-    lng: null
-  };
+    return (
+      distanceDiff <
+      DRIVING_DEDUP_DISTANCE_KM
+    );
+  });
 }
 
+// ============================================================
+// Supabase upsert
+// ============================================================
 
-function extractGpsFromLocation(
-  location
+async function upsertWithRetry(
+  supabase,
+  tableName,
+  records,
+  options = {},
+  maxRetries = 3
 ) {
+  const CHUNK_SIZE = 30;
+
+  let totalSaved = 0;
+
+  for (
+    let i = 0;
+    i < records.length;
+    i += CHUNK_SIZE
+  ) {
+    const chunk =
+      records.slice(
+        i,
+        i + CHUNK_SIZE
+      );
+
+    let attempt = 0;
+    let success = false;
+
+    while (
+      attempt < maxRetries &&
+      !success
+    ) {
+      attempt++;
+
+      try {
+        let {
+          data: inserted,
+          error
+        } = await supabase
+          .from(tableName)
+          .upsert(
+            chunk,
+            options
+          )
+          .select();
+
+        if (
+          error &&
+          (
+            error.message?.includes(
+              'location_list'
+            ) ||
+            error.code === '22P02'
+          )
+        ) {
+          const fallbackChunk =
+            chunk.map(item => ({
+              ...item,
+              location_list:
+                typeof item.location_list ===
+                'object'
+                  ? JSON.stringify(
+                      item.location_list
+                    )
+                  : item.location_list
+            }));
+
+          const retry =
+            await supabase
+              .from(tableName)
+              .upsert(
+                fallbackChunk,
+                options
+              )
+              .select();
+
+          error = retry.error;
+          inserted = retry.data;
+        }
+
+        if (error) {
+          throw error;
+        }
+
+        totalSaved +=
+          inserted?.length ||
+          chunk.length;
+
+        success = true;
+      } catch (err) {
+        console.warn(
+          `⚠️ [${tableName}] 저장 시도 ${attempt}/${maxRetries} 실패:`,
+          err.message
+        );
+
+        if (
+          attempt >= maxRetries
+        ) {
+          console.error(
+            `❌ Supabase ${tableName} 저장 최종 실패`
+          );
+        } else {
+          await new Promise(
+            resolve =>
+              setTimeout(
+                resolve,
+                2000
+              )
+          );
+        }
+      }
+    }
+  }
+
+  return totalSaved;
+}
+
+// ============================================================
+// PSI 변환
+// ============================================================
+
+function convertToPsi(val) {
+  if (!val || isNaN(val)) {
+    return 0;
+  }
+
+  const num = Number(val);
 
   if (
-    !location ||
-    typeof location !== 'string'
+    num > 0 &&
+    num < 10
   ) {
-    return {
-      lat: null,
-      lng: null
-    };
-  }
-
-  let m =
-    location.match(
-      /(\d+\.\d+)[\s,]+(\d+\.\d+)/
+    return Math.round(
+      num * 14.5038
     );
-
-  if (m) {
-    return {
-      lat: parseFloat(m[1]),
-      lng: parseFloat(m[2])
-    };
   }
 
-  m =
-    location.match(
-      /(\d+\.\d+)\s+(\d+\.\d+)/
-    );
-
-  if (m) {
-    return {
-      lat: parseFloat(m[1]),
-      lng: parseFloat(m[2])
-    };
-  }
-
-  return {
-    lat: null,
-    lng: null
-  };
+  return Math.round(num);
 }
 
 // ============================================================
-// 🚀 Handler
+// 여기까지가 1부
 // ============================================================
-
-module.exports = async function handler(req, res) {
-
-  res.setHeader(
-    'Access-Control-Allow-Origin',
-    '*'
-  );
-
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, OPTIONS'
-  );
-
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization'
-  );
-
-
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({
-      error: 'Method not allowed'
-    });
-  }
-
-
-  if (!SUPABASE_KEY) {
-    return res.status(500).json({
-      error: 'Supabase key missing'
-    });
-  }
-
-
-  const supabase =
-    createClient(
-      SUPABASE_URL,
-      SUPABASE_KEY
-    );
-
-
-  console.log(
-    '⚡ Fast Sync 시작'
-  );
-
-
-  try {
-
-    const body =
-      req.body || {};
-
-    const vehicleId =
-      body.vehicleId ||
-      body.vehicle_id ||
-      VEHICLE_ID;
-
-
-    // ========================================================
-    // 🔑 Google 인증
-    // ========================================================
-
-    const token =
-      await getGoogleIdToken();
-
-    if (!token) {
-
-      return res.status(401).json({
-        success: false,
-        error: 'Google auth failed'
-      });
-    }
-
-
-    // ========================================================
-    // 📊 마지막 기록 시간
-    // ========================================================
-
-    const last =
-      await getLastRecordTimestamps(
-        supabase
-      );
-
-
-    const since = {};
-
-
-    for (
-      const key of [
-        'driving',
-        'vehicle',
-        'charging'
-      ]
-    ) {
-
-      if (last[key]) {
-
-        const d =
-          new Date(last[key]);
-
-        // 최근 24시간을 다시 조회
-        // Firestore 정렬/시간 차이로 인한 누락 방지
-        d.setDate(
-          d.getDate() - 1
-        );
-
-        since[key] = d;
-
-      } else {
-
-        since[key] = null;
-      }
-    }
-
-
-    // ========================================================
-    // 🆔 기존 Supabase ID
-    // ========================================================
-
-    const existingIds = {};
-
-
-    for (
-      const table of [
-        'vehicle',
-        'driving',
-        'charging'
-      ]
-    ) {
-
-      const { data, error } =
-        await supabase
-          .from(table)
-          .select('id');
-
-
-      if (error) {
-
-        console.warn(
-          `⚠️ [${table}] 기존 ID 조회 실패:`,
-          error.message
-        );
-
-        existingIds[table] =
-          new Set();
-
-      } else {
-
-        existingIds[table] =
-          new Set(
-            (data || [])
-              .map(row => row.id)
-          );
-      }
-    }
-
-
-    const collections = [
-
-      {
-        name: 'vehicle_state',
-        table: 'vehicle',
-        since: since.vehicle
-      },
-
-      {
-        name: 'driving',
-        table: 'driving',
-        since: since.driving
-      },
-
-      {
-        name: 'charging',
-        table: 'charging',
-        since: since.charging
-      }
-
-    ];
-
-
-    const summary = {
-      vehicle: 0,
-      driving: 0,
-      charging: 0,
-      duration_fixed: 0
-    };
-
-
-    // ========================================================
-    // 🔄 Collection 처리
-    // ========================================================
-
-    for (
-      const col of collections
-    ) {
-
-      console.log(
-        `\n📥 [${col.table}] Firestore 조회`
-      );
-
-
-      const docs =
-        await withTimeout(
-          fetchFirestoreDocsSince(
-            col.name,
-            token,
-            col.since
-          ),
-          8000
-        );
-
-
-      console.log(
-        `📦 [${col.table}] 수신: ${docs.length}건`
-      );
-
-
-      const newDocs =
-        docs.filter(doc => {
-
-          const docId =
-            doc.name
-              ?.split('/')
-              .pop();
+      // ============================================================
+      // 🔥 중복 운행 제거
+      // ============================================================
+      //
+      // 같은 운행이 Firestore에 여러 번 기록되는 경우를 방지합니다.
+      //
+      // 기준:
+      //   1. start_time 차이 <= 5분
+      //   2. distance_km 차이 < 0.5km
+      //
+      // 단순히 created_at을 비교하면 동기화 시각이 달라져
+      // 정상적인 운행도 중복으로 판단할 수 있으므로
+      // 반드시 실제 운행 start_time을 기준으로 합니다.
+      //
+      const DEDUP_WINDOW_MS = 5 * 60 * 1000;
+      const DEDUP_DISTANCE_KM = 0.5;
+
+      const newStartMs = newRecord.start_time
+        ? new Date(newRecord.start_time).getTime()
+        : null;
+
+      let duplicateIndex = -1;
+
+      if (newStartMs && !isNaN(newStartMs)) {
+        duplicateIndex = drivingBatch.findIndex(existing => {
+          if (!existing.start_time) return false;
+
+          const existingStartMs =
+            new Date(existing.start_time).getTime();
+
+          if (isNaN(existingStartMs)) return false;
+
+          const timeDiff =
+            Math.abs(existingStartMs - newStartMs);
+
+          const distanceDiff =
+            Math.abs(
+              Number(existing.distance_km || existing.move_km || 0) -
+              Number(newRecord.distance_km || newRecord.move_km || 0)
+            );
 
           return (
-            docId &&
-            !existingIds[col.table]
-              .has(docId)
+            timeDiff <= DEDUP_WINDOW_MS &&
+            distanceDiff < DEDUP_DISTANCE_KM
           );
         });
+      }
 
+      if (duplicateIndex !== -1) {
+        const existing = drivingBatch[duplicateIndex];
 
-      console.log(
-        `🆕 [${col.table}] 신규: ${newDocs.length}건`
-      );
+        // 같은 운행이면 더 완전한 데이터를 우선합니다.
+        const existingDuration =
+          Number(existing.duration_min || existing.driving_time || 0);
 
+        const newDuration =
+          Number(newRecord.duration_min || newRecord.driving_time || 0);
 
-      if (!newDocs.length) {
+        const existingLocationCount =
+          Array.isArray(existing.location_list)
+            ? existing.location_list.length
+            : 0;
+
+        const newLocationCount =
+          Array.isArray(newRecord.location_list)
+            ? newRecord.location_list.length
+            : 0;
+
+        const shouldReplace =
+          newDuration > existingDuration ||
+          (
+            newDuration === existingDuration &&
+            newLocationCount > existingLocationCount
+          );
+
+        if (shouldReplace) {
+          drivingBatch[duplicateIndex] = newRecord;
+          console.log(
+            `🔄 [driving] 중복 운행 교체: ` +
+            `${existing.id} -> ${newRecord.id} ` +
+            `(시간 ${newDuration}분, 위치 ${newLocationCount}개)`
+          );
+        } else {
+          console.log(
+            `⏭️ [driving] 중복 운행 스킵: ${newRecord.id}`
+          );
+        }
+
+        drivingDedupSkipped++;
         continue;
       }
 
-
-      const batch = [];
-
-
-      // ======================================================
-      // 📄 각 Firestore 문서
-      // ======================================================
-
-      for (
-        const doc of newDocs
-      ) {
-
-        const parsed =
-          parseFirestoreFields(
-            doc.fields || {}
-          );
-
-
-        const docId =
-          doc.name
-            ?.split('/')
-            .pop();
-
-
-        if (!docId) {
-          continue;
-        }
-
-
-        const base = {
-          id: docId,
-          user_uid: USER_UID,
-          vehicle_id: vehicleId
-        };
-
-
-        // ====================================================
-        // 🚗 VEHICLE
-        // ====================================================
-
-        if (
-          col.table === 'vehicle'
-        ) {
-
-          const logs =
-            Array.isArray(
-              parsed.stateLogs
-            )
-              ? parsed.stateLogs
-              : [];
-
-
-          const latest =
-            logs.length
-              ? logs[logs.length - 1]
-              : parsed;
-
-
-          const rawStart =
-            latest.startDateTime ??
-            latest.start_time ??
-            parsed.startDateTime ??
-            parsed.start_time ??
-            null;
-
-
-          const rawEnd =
-            latest.endDateTime ??
-            latest.end_time ??
-            parsed.endDateTime ??
-            parsed.end_time ??
-            null;
-
-
-          const startTime =
-            safeToISOString(
-              rawStart,
-              null
-            );
-
-
-          const endTime =
-            safeToISOString(
-              rawEnd,
-              null
-            );
-
-
-          let durationMinutes = 0;
-
-
-          if (
-            startTime &&
-            endTime
-          ) {
-
-            durationMinutes =
-              calculateDurationMinutes(
-                startTime,
-                endTime,
-                0
-              );
-          }
-
-
-          batch.push({
-
-            ...base,
-
-            state:
-              String(
-                latest.state ||
-                parsed.state ||
-                'online'
-              ).toLowerCase(),
-
-            battery_level:
-              Number(
-                latest.battery_level ??
-                parsed.battery_level ??
-                0
-              ),
-
-            battery_range:
-              Number(
-                latest.battery_range ??
-                parsed.battery_range ??
-                0
-              ),
-
-            added_charging:
-              Number(
-                latest.addedCharging ??
-                parsed.addedCharging ??
-                0
-              ),
-
-            outside_temp:
-              Number(
-                latest.out_temp ??
-                latest.outside_temp ??
-                parsed.out_temp ??
-                0
-              ),
-
-            duration_min:
-              durationMinutes,
-
-            start_time:
-              startTime,
-
-            end_time:
-              endTime,
-
-            odometer:
-              Math.round(
-                Number(
-                  latest.odometer ??
-                  parsed.odometer ??
-                  0
-                ) * 10
-              ) / 10,
-
-            updated_at:
-              new Date().toISOString(),
-
-            raw_data:
-              parsed
-          });
-
-
-          continue;
-        }
-
-
-        // ====================================================
-        // 🛣️ DRIVING
-        // ====================================================
-
-        if (
-          col.table === 'driving'
-        ) {
-
-          const dist =
-            Number(
-              parsed.moveKM ??
-              parsed.move_km ??
-              parsed.distance_km ??
-              parsed.distance ??
-              0
-            );
-
-
-          // 50m 미만 쓰레기 데이터 차단
-          if (
-            !isFinite(dist) ||
-            dist < 0.05
-          ) {
-
-            console.log(
-              `⏭️ [driving] ` +
-              `${docId} 거리 ${dist}km → 스킵`
-            );
-
-            continue;
-          }
-
-
-          // --------------------------------------------------
-          // 실제 start / end 시간 찾기
-          // --------------------------------------------------
-
-          const rawStart =
-            parsed.start_time ??
-            parsed.startTime ??
-            parsed.startDateTime ??
-            parsed.started_at ??
-            null;
-
-
-          const rawEnd =
-            parsed.end_time ??
-            parsed.endTime ??
-            parsed.endDateTime ??
-            parsed.ended_at ??
-            null;
-
-
-          const createdFallback =
-            safeToISOString(
-              parsed.date ??
-              parsed.created_at ??
-              doc.createTime,
-              new Date().toISOString()
-            );
-
-
-          const startTime =
-            safeToISOString(
-              rawStart,
-              createdFallback
-            );
-
-
-          const endTime =
-            safeToISOString(
-              rawEnd,
-              startTime
-            );
-
-
-          // --------------------------------------------------
-          // Firestore duration
-          // --------------------------------------------------
-
-          const firestoreDuration =
-            parseDrivingTimeToMinutes(
-              parsed.duration_min ??
-              parsed.driving_time ??
-              parsed.duration ??
-              parsed.durationMin ??
-              0
-            );
-
-
-          // --------------------------------------------------
-          // 실제 시간 차이를 최우선 사용
-          // --------------------------------------------------
-
-          let durationMinutes =
-            calculateDurationMinutes(
-              startTime,
-              endTime,
-              firestoreDuration
-            );
-
-
-          // 잘못된 음수/NaN 방지
-          if (
-            !isFinite(durationMinutes) ||
-            durationMinutes < 0
-          ) {
-            durationMinutes = 0;
-          }
-
-
-          const locList =
-            parsed.location_list ??
-            parsed.path ??
-            [];
-
-
-          const useBattery =
-            Number(
-              parsed.useBattery ??
-              parsed.use_battery ??
-              parsed.battery_used ??
-              0
-            );
-
-
-          const outsideTempRaw =
-            parsed.outside_temp ??
-            parsed.outTemp ??
-            null;
-
-
-          const outsideTemp =
-            outsideTempRaw === null
-              ? null
-              : Number(
-                  outsideTempRaw
-                );
-
-
-          const startDong =
-            parsed.start_dong ??
-            parsed.startDong ??
-            parsed.start_address ??
-            parsed.startAddress ??
-            null;
-
-
-          const endDong =
-            parsed.end_dong ??
-            parsed.endDong ??
-            parsed.end_address ??
-            parsed.endAddress ??
-            null;
-
-
-          const newRecord = {
-
-            ...base,
-
-            distance_km:
-              dist,
-
-            move_km:
-              dist,
-
-            use_battery:
-              isFinite(useBattery)
-                ? useBattery
-                : 0,
-
-            duration_min:
-              durationMinutes,
-
-            driving_time:
-              durationMinutes,
-
-            start_time:
-              startTime,
-
-            end_time:
-              endTime,
-
-            start_dong:
-              startDong,
-
-            end_dong:
-              endDong,
-
-            start_address:
-              startDong,
-
-            end_address:
-              endDong,
-
-            location_list:
-              Array.isArray(locList)
-                ? locList
-                : [],
-
-            outside_temp:
-              isFinite(outsideTemp)
-                ? outsideTemp
-                : null,
-
-            created_at:
-              createdFallback
-          };
-
-
-          // ==================================================
-          // 🔥 신규 batch 내부 중복 방지
-          //
-          // 같은 시간 ±5분
-          // + 거리 차이 < 0.5km
-          //
-          // 단순 created_at이 아니라
-          // 실제 start_time을 기준으로 비교
-          // ==================================================
-
-          const DEDUP_WINDOW_MS =
-            5 * 60 * 1000;
-
-
-          const newStartMs =
-            newRecord.start_time
-              ? new Date(
-                  newRecord.start_time
-                ).getTime()
-              : null;
-
-
-          let dupIdx = -1;
-
-
-          if (
-            newStartMs &&
-            isFinite(newStartMs)
-          ) {
-
-            dupIdx =
-              batch.findIndex(
-                item => {
-
-                  if (
-                    !item.start_time
-                  ) {
-                    return false;
-                  }
-
-
-                  const itemStartMs =
-                    new Date(
-                      item.start_time
-                    ).getTime();
-
-
-                  if (
-                    !isFinite(
-                      itemStartMs
-                    )
-                  ) {
-                    return false;
-                  }
-
-
-                  const timeDiff =
-                    Math.abs(
-                      itemStartMs -
-                      newStartMs
-                    );
-
-
-                  const distDiff =
-                    Math.abs(
-                      Number(
-                        item.distance_km ||
-                        item.move_km ||
-                        0
-                      ) -
-                      Number(
-                        newRecord.distance_km ||
-                        0
-                      )
-                    );
-
-
-                  return (
-                    timeDiff <=
-                      DEDUP_WINDOW_MS &&
-                    distDiff < 0.5
-                  );
-                }
-              );
-          }
-
-
-          if (
-            dupIdx !== -1
-          ) {
-
-            console.log(
-              `⏭️ [driving] ` +
-              `유사 운행 중복 스킵: ` +
-              `${docId}`
-            );
-
-
-            // 시간이 더 긴 기록을 보존
-            if (
-              (
-                newRecord.duration_min ||
-                0
-              ) >
-              (
-                batch[dupIdx]
-                  .duration_min ||
-                0
-              )
-            ) {
-
-              batch[dupIdx] =
-                newRecord;
-
-              console.log(
-                `🔄 [driving] ` +
-                `더 정확한 긴 기록으로 교체`
-              );
-            }
-
-
-            continue;
-          }
-
-
-          batch.push(
-            newRecord
-          );
-
-          continue;
-        }
-
-
-        // ====================================================
-        // 🔌 CHARGING
-        // ====================================================
-
-        if (
-          col.table === 'charging'
-        ) {
-
-          const nowBattery =
-            Number(
-              parsed.nowBattery ??
-              parsed.now_battery ??
-              parsed.battery_level ??
-              0
-            );
-
-
-          const addedBatteryLevel =
-            Number(
-              parsed.addedBatteryLevel ??
-              parsed.added_battery_level ??
-              parsed.added_battery ??
-              0
-            );
-
-
-          const startBattery =
-            Number(
-              parsed.startBattery ??
-              parsed.start_battery ??
-              0
-            );
-
-
-          const addedCharging =
-            Number(
-              parsed.addedCharging ??
-              parsed.added_charging ??
-              parsed.added_kwh ??
-              0
-            );
-
-
-          const addedBatteryRange =
-            Number(
-              parsed.addedBatteryRange ??
-              parsed.added_battery_range ??
-              parsed.added_range ??
-              0
-            );
-
-
-          let finalStartBattery =
-            startBattery;
-
-
-          if (
-            finalStartBattery === 0 &&
-            nowBattery > 0 &&
-            addedBatteryLevel > 0
-          ) {
-
-            finalStartBattery =
-              Math.max(
-                0,
-                nowBattery -
-                addedBatteryLevel
-              );
-          }
-
-
-          let locList =
-            parsed.location_list ??
-            parsed.location ??
-            parsed.path ??
-            [];
-
-
-          if (
-            typeof locList === 'string'
-          ) {
-
-            try {
-
-              locList =
-                JSON.parse(locList);
-
-            } catch (e) {
-
-              locList = [];
-            }
-          }
-
-
-          if (
-            !Array.isArray(locList)
-          ) {
-
-            locList = [];
-          }
-
-
-          const rawDate =
-            parsed.date ??
-            parsed.created_at ??
-            parsed.timestamp ??
-            doc.createTime ??
-            null;
-
-
-          const dateISO =
-            safeToISOString(
-              rawDate,
-              new Date().toISOString()
-            );
-
-
-          const newRecord = {
-
-            ...base,
-
-            date:
-              dateISO,
-
-            now_battery:
-              Math.round(
-                nowBattery * 100
-              ) / 100,
-
-            added_battery_level:
-              Math.round(
-                addedBatteryLevel * 100
-              ) / 100,
-
-            start_battery:
-              Math.round(
-                finalStartBattery * 100
-              ) / 100,
-
-            added_charging:
-              Math.round(
-                addedCharging * 100
-              ) / 100,
-
-            added_battery_range:
-              Math.round(
-                addedBatteryRange * 100
-              ) / 100,
-
-            location_list:
-              locList,
-
-            raw_data:
-              parsed,
-
-            created_at:
-              dateISO
-          };
-
-
-          // --------------------------------------------------
-          // 충전 중복
-          // --------------------------------------------------
-
-          const DEDUP_WINDOW_MS =
-            5 * 60 * 1000;
-
-
-          const newDateMs =
-            newRecord.date
-              ? new Date(
-                  newRecord.date
-                ).getTime()
-              : null;
-
-
-          let dupIdx = -1;
-
-
-          if (
-            newDateMs &&
-            isFinite(newDateMs)
-          ) {
-
-            dupIdx =
-              batch.findIndex(
-                item => {
-
-                  if (!item.date) {
-                    return false;
-                  }
-
-
-                  const itemDateMs =
-                    new Date(
-                      item.date
-                    ).getTime();
-
-
-                  if (
-                    !isFinite(
-                      itemDateMs
-                    )
-                  ) {
-                    return false;
-                  }
-
-
-                  const diff =
-                    Math.abs(
-                      itemDateMs -
-                      newDateMs
-                    );
-
-
-                  const batDiff =
-                    Math.abs(
-                      Number(
-                        item.added_battery_level ||
-                        0
-                      ) -
-                      Number(
-                        newRecord.added_battery_level ||
-                        0
-                      )
-                    );
-
-
-                  return (
-                    diff <=
-                      DEDUP_WINDOW_MS &&
-                    batDiff < 5
-                  );
-                }
-              );
-          }
-
-
-          if (
-            dupIdx !== -1
-          ) {
-
-            if (
-              (
-                newRecord.added_charging ||
-                0
-              ) >
-              (
-                batch[dupIdx]
-                  .added_charging ||
-                0
-              )
-            ) {
-
-              batch[dupIdx] =
-                newRecord;
-            }
-
-            continue;
-          }
-
-
-          batch.push(
-            newRecord
-          );
-        }
-      }
-
-
-      // ======================================================
-      // 💾 저장
-      // ======================================================
-
-      if (
-        batch.length
-      ) {
-
-        const saved =
-          await upsertWithRetry(
-            supabase,
-            col.table,
-            batch
-          );
-
-
-        summary[col.table] =
-          saved;
-
-
-        console.log(
-          `✅ [${col.table}] ` +
-          `${saved}건 저장`
-        );
-      }
+      drivingBatch.push(newRecord);
     }
 
-
-    // ========================================================
-    // 🔧 driving 시간 최종 보정
-    //
-    // Firestore에서 start/end를 못 가져온 기록이나
-    // 기존 기록 중 duration이 0/NULL인 경우
-    // Supabase의 실제 timestamp를 기준으로 보정
-    // ========================================================
+    // ============================================================
+    // driving 저장
+    // ============================================================
+    if (drivingBatch.length > 0) {
+      summary.driving += await upsertWithRetry(
+        supabase,
+        'driving',
+        drivingBatch,
+        {
+          onConflict: 'id',
+          ignoreDuplicates: false
+        }
+      );
+    }
 
     console.log(
-      '🔧 [driving] duration 최종 보정 시작'
+      `📌 [driving] 신규 저장 ${summary.driving}건, ` +
+      `기존 스킵 ${drivingSkipped}건, ` +
+      `중복/0km차단 ${drivingDedupSkipped}건`
     );
 
-
+    // ============================================================
+    // 🔥 기존 driving 데이터의 시간 보정
+    // ============================================================
+    //
+    // 기존 DB에 duration_min / driving_time이 0 또는 NULL인
+    // 데이터가 이미 존재할 수 있습니다.
+    //
+    // start_time / end_time이 정상적으로 존재하면
+    // 실제 시간 차이를 계산하여 보정합니다.
+    //
+    // 단, 여기서는 SQL RPC를 직접 만들지 않고
+    // Supabase RPC가 존재하는 경우에만 실행합니다.
+    //
     try {
-
-      const {
-        data: fixedCount,
-        error: durationError
-      } =
-        await supabase.rpc(
-          'fix_driving_duration'
-        );
-
+      const { error: durationError } = await supabase.rpc(
+        'fix_driving_duration'
+      );
 
       if (durationError) {
-
-        console.error(
-          '❌ [driving] duration RPC 실패:',
+        console.log(
+          'ℹ️ [driving] fix_driving_duration RPC 미사용:',
           durationError.message
         );
+      }
+    } catch (e) {
+      console.log(
+        'ℹ️ [driving] 기존 duration 보정 RPC 건너뜀:',
+        e.message
+      );
+    }
 
-      } else {
+    // ============================================================
+    // ========== charging ==========
+    // ============================================================
 
-        summary.duration_fixed =
+    const existingChargingIds =
+      await fetchExistingIds(supabase, 'charging');
+
+    const chargingBaseUrl =
+      `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}` +
+      `/databases/(default)/documents/vehicle/${vehicleId}/charging`;
+
+    const chargingDocs =
+      await fetchAllFirestoreDocs(chargingBaseUrl, headers);
+
+    const chargingBatch = [];
+
+    let chargingSkipped = 0;
+    let chargingDedupSkipped = 0;
+
+    if (chargingDocs.length > 0) {
+      console.log(
+        '🔍 [DEBUG] Charging sample fields:',
+        JSON.stringify(
+          chargingDocs[0].fields,
+          null,
+          2
+        ).substring(0, 600)
+      );
+    }
+
+    for (const doc of chargingDocs) {
+      const fields = doc.fields || {};
+      const p = parseFirestoreFields(fields);
+
+      const docId = doc.name?.split('/').pop();
+
+      if (!docId) continue;
+
+      if (existingChargingIds.has(docId)) {
+        chargingSkipped++;
+        continue;
+      }
+
+      // ----------------------------------------------------------
+      // 날짜
+      // ----------------------------------------------------------
+
+      let dateISO = null;
+
+      if (p.date) {
+        dateISO = safeToISOString(
+          p.date,
+          null
+        );
+      }
+
+      if (!dateISO) {
+        dateISO = safeToISOString(
+          p.created_at || p.timestamp,
+          doc.createTime ||
+          new Date().toISOString()
+        );
+      }
+
+      // ----------------------------------------------------------
+      // 배터리
+      // ----------------------------------------------------------
+
+      const nowBattery =
+        Number(
+          p.nowBattery ??
+          p.now_battery ??
+          p.battery_level ??
+          p.battery ??
+          0
+        );
+
+      const addedBatteryLevel =
+        Number(
+          p.addedBatteryLevel ??
+          p.added_battery_level ??
+          p.added_battery ??
+          0
+        );
+
+      let startBattery =
+        Number(
+          p.startBattery ??
+          p.start_battery ??
+          0
+        );
+
+      if (
+        startBattery === 0 &&
+        nowBattery > 0 &&
+        addedBatteryLevel > 0
+      ) {
+        startBattery =
+          Math.max(
+            0,
+            nowBattery - addedBatteryLevel
+          );
+      }
+
+      // ----------------------------------------------------------
+      // 충전량
+      // ----------------------------------------------------------
+
+      const addedCharging =
+        Number(
+          p.addedCharging ??
+          p.added_charging ??
+          p.added_kwh ??
+          p.kwh ??
+          0
+        );
+
+      const addedBatteryRange =
+        Number(
+          p.addedBatteryRange ??
+          p.added_battery_range ??
+          p.added_range ??
+          0
+        );
+
+      // ----------------------------------------------------------
+      // 위치
+      // ----------------------------------------------------------
+
+      let locList =
+        p.location_list ??
+        p.location ??
+        p.path ??
+        [];
+
+      if (typeof locList === 'string') {
+        try {
+          locList = JSON.parse(locList);
+        } catch (e) {
+          locList = [];
+        }
+      }
+
+      if (!Array.isArray(locList)) {
+        locList = [];
+      }
+
+      const newRecord = {
+        id: docId,
+
+        user_uid: USER_UID,
+
+        vehicle_id: vehicleId,
+
+        date: dateISO,
+
+        now_battery:
+          Math.round(nowBattery * 100) / 100,
+
+        added_battery_level:
+          Math.round(addedBatteryLevel * 100) / 100,
+
+        start_battery:
+          Math.round(startBattery * 100) / 100,
+
+        added_charging:
+          Math.round(addedCharging * 100) / 100,
+
+        added_battery_range:
+          Math.round(addedBatteryRange * 100) / 100,
+
+        location_list: locList,
+
+        raw_data: p,
+
+        created_at:
+          dateISO ||
+          new Date().toISOString()
+      };
+
+      // ==========================================================
+      // 🔥 charging 중복 검사
+      // ==========================================================
+
+      const DEDUP_WINDOW_MS =
+        5 * 60 * 1000;
+
+      const newDateMs =
+        newRecord.date
+          ? new Date(newRecord.date).getTime()
+          : null;
+
+      let duplicateIndex = -1;
+
+      if (
+        newDateMs &&
+        !isNaN(newDateMs)
+      ) {
+        duplicateIndex =
+          chargingBatch.findIndex(existing => {
+
+            if (!existing.date) {
+              return false;
+            }
+
+            const existingDateMs =
+              new Date(existing.date).getTime();
+
+            if (isNaN(existingDateMs)) {
+              return false;
+            }
+
+            const timeDiff =
+              Math.abs(
+                existingDateMs - newDateMs
+              );
+
+            const batteryDiff =
+              Math.abs(
+                Number(
+                  existing.added_battery_level || 0
+                ) -
+                Number(
+                  newRecord.added_battery_level || 0
+                )
+              );
+
+            return (
+              timeDiff <= DEDUP_WINDOW_MS &&
+              batteryDiff < 5
+            );
+          });
+      }
+
+      if (duplicateIndex !== -1) {
+        const existing =
+          chargingBatch[duplicateIndex];
+
+        const existingCharging =
           Number(
-            fixedCount || 0
+            existing.added_charging || 0
           );
 
+        const newCharging =
+          Number(
+            newRecord.added_charging || 0
+          );
 
-        console.log(
-          `🔧 [driving] duration 보정 완료: ` +
-          `${summary.duration_fixed}건`
-        );
+        if (newCharging > existingCharging) {
+          chargingBatch[duplicateIndex] =
+            newRecord;
+
+          console.log(
+            `🔄 [charging] 더 정확한 기록으로 교체: ` +
+            `${existing.id} -> ${newRecord.id}`
+          );
+        } else {
+          console.log(
+            `⏭️ [charging] 중복 충전 기록 스킵: ${newRecord.id}`
+          );
+        }
+
+        chargingDedupSkipped++;
+        continue;
       }
 
-    } catch (e) {
-
-      console.error(
-        '❌ [driving] duration RPC 실행 오류:',
-        e.message
-      );
+      chargingBatch.push(newRecord);
     }
 
+    // ============================================================
+    // charging 저장
+    // ============================================================
 
-    // ========================================================
-    // 📍 outside_temp 보정
-    // ========================================================
-
-    try {
-
-      const {
-        error
-      } =
-        await supabase.rpc(
-          'update_driving_outside_temp'
+    if (chargingBatch.length > 0) {
+      summary.charging +=
+        await upsertWithRetry(
+          supabase,
+          'charging',
+          chargingBatch,
+          {
+            onConflict: 'id'
+          }
         );
-
-
-      if (error) {
-
-        console.warn(
-          '⚠️ outside_temp RPC 실패:',
-          error.message
-        );
-      }
-
-    } catch (e) {
-
-      console.warn(
-        '⚠️ outside_temp RPC 오류:',
-        e.message
-      );
     }
-
-
-    // ========================================================
-    // 📅 Calendar
-    //
-    // Fast Sync에서는 처리하지 않음.
-    // Full sync.js에서 처리.
-    // ========================================================
 
     console.log(
-      '⏭️ 캘린더 동기화는 ' +
-      'Full Sync(sync.js)에서 처리됩니다.'
+      `📌 [charging] 신규 저장 ${summary.charging}건, ` +
+      `기존 스킵 ${chargingSkipped}건, ` +
+      `중복처리 ${chargingDedupSkipped}건`
     );
 
+    // ============================================================
+    // 🔥 주행 외부온도 보정
+    // ============================================================
 
-    // ========================================================
-    // ✅ 결과
-    // ========================================================
+    try { 
+  await supabase.rpc('update_driving_outside_temp'); 
+} catch (e) {}
+
+// 🔥 driving 실제 시간 기반 duration 보정
+try {
+  const { data: fixedCount, error: durationError } =
+    await supabase.rpc('fix_driving_duration');
+
+  if (durationError) {
+    console.error(
+      '❌ [driving] duration 보정 실패:',
+      durationError.message
+    );
+  } else {
+    console.log(
+      `🔧 [driving] duration 보정 완료: ${fixedCount || 0}건`
+    );
+  }
+} catch (e) {
+  console.error(
+    '❌ [driving] duration RPC 실행 오류:',
+    e.message
+  );
+}
+
+// ========== 캘린더 동기화 =========
+    if (GOOGLE_CALENDAR_ICS_URL) {
+
+      console.log(
+        '📅 구글 캘린더 동기화 시작...'
+      );
+
+      const { count } =
+        await supabase
+          .from('calendar_events')
+          .select('*', {
+            count: 'exact',
+            head: true
+          });
+
+      const isInitialRun =
+        count === 0;
+
+      const filterStartDate =
+        isInitialRun
+          ? new Date('2025-08-01T00:00:00Z')
+          : new Date(
+              Date.now() -
+              30 * 24 * 60 * 60 * 1000
+            );
+
+      console.log(
+        `📅 필터 시작일: ${filterStartDate.toISOString()}`
+      );
+
+      // ----------------------------------------------------------
+      // 기존 GPS 캐시
+      // ----------------------------------------------------------
+
+      const existingGpsMap =
+        new Map();
+
+      const {
+        data: existingRows
+      } =
+        await supabase
+          .from('calendar_events')
+          .select(
+            'uid, location, gps_lat, gps_lng'
+          )
+          .not(
+            'gps_lat',
+            'is',
+            null
+          );
+
+      (existingRows || [])
+        .forEach(row => {
+
+          existingGpsMap.set(
+            row.uid,
+            {
+              location: row.location,
+              lat: row.gps_lat,
+              lng: row.gps_lng
+            }
+          );
+
+        });
+
+      // ----------------------------------------------------------
+      // ICS
+      // ----------------------------------------------------------
+
+      const events =
+        await ical.async.fromURL(
+          GOOGLE_CALENDAR_ICS_URL
+        );
+
+      const calendarBatch = [];
+
+      let totalEvents = 0;
+      let skippedNoKorean = 0;
+      let geocodeCount = 0;
+
+      for (const key in events) {
+
+        const ev = events[key];
+
+        if (ev.type !== 'VEVENT') {
+          continue;
+        }
+
+        const eventStart =
+          ev.start
+            ? new Date(ev.start)
+            : null;
+
+        if (
+          !eventStart ||
+          eventStart < filterStartDate
+        ) {
+          continue;
+        }
+
+        const summary =
+          ev.summary || '';
+
+        // 한글 없는 일정 제외
+        if (!/[가-힣]/.test(summary)) {
+
+          console.log(
+            `⏭️ 한글 없음, 스킵: "${summary.substring(0, 30)}"`
+          );
+
+          skippedNoKorean++;
+
+          continue;
+        }
+
+        totalEvents++;
+
+        const location =
+          ev.location || '';
+
+        let gpsLat = null;
+        let gpsLng = null;
+
+        const uid =
+          ev.uid ||
+          `event_${Date.now()}_${Math.random()}`;
+
+        const cached =
+          existingGpsMap.get(uid);
+
+        // --------------------------------------------------------
+        // 기존 GPS 사용
+        // --------------------------------------------------------
+
+        if (
+          cached &&
+          cached.location === location &&
+          cached.lat &&
+          cached.lng
+        ) {
+
+          gpsLat = cached.lat;
+          gpsLng = cached.lng;
+
+        } else {
+
+          // ------------------------------------------------------
+          // 위치 문자열에서 GPS 직접 추출
+          // ------------------------------------------------------
+
+          const parsed =
+            extractGpsFromLocation(
+              location
+            );
+
+          if (
+            parsed.lat &&
+            parsed.lng
+          ) {
+
+            gpsLat = parsed.lat;
+            gpsLng = parsed.lng;
+
+          } else if (
+            KAKAO_REST_API_KEY &&
+            location.length > 3
+          ) {
+
+            console.log(
+              `🔍 Geocoding: "${location.substring(0, 40)}..."`
+            );
+
+            const geocoded =
+              await geocodeAddressKakao(
+                location
+              );
+
+            if (
+              geocoded.lat &&
+              geocoded.lng
+            ) {
+
+              gpsLat = geocoded.lat;
+              gpsLng = geocoded.lng;
+
+              geocodeCount++;
+
+              console.log(
+                `✅ Geocoding 성공: (${gpsLat}, ${gpsLng})`
+              );
+            }
+
+            await new Promise(
+              r => setTimeout(r, 300)
+            );
+          }
+        }
+
+        calendarBatch.push({
+
+          uid,
+
+          summary,
+
+          description:
+            ev.description || '',
+
+          location,
+
+          start_time:
+            ev.start
+              ? new Date(ev.start).toISOString()
+              : null,
+
+          end_time:
+            ev.end
+              ? new Date(ev.end).toISOString()
+              : null,
+
+          updated_at:
+            new Date().toISOString(),
+
+          gps_lat: gpsLat,
+
+          gps_lng: gpsLng
+        });
+      }
+
+      console.log(
+        `📊 캘린더 통계: ` +
+        `총 ${totalEvents}개, ` +
+        `한글 없어 스킵 ${skippedNoKorean}개, ` +
+        `Geocoding 성공 ${geocodeCount}개`
+      );
+
+      if (calendarBatch.length > 0) {
+
+        summary.calendar =
+          await upsertWithRetry(
+            supabase,
+            'calendar_events',
+            calendarBatch,
+            {
+              onConflict: 'uid'
+            }
+          );
+
+        console.log(
+          `✅ 캘린더 ${summary.calendar}개 저장`
+        );
+      }
+    }
+
+    // ============================================================
+    // 최종 결과
+    // ============================================================
+
+    console.log(
+      '============================================'
+    );
+
+    console.log(
+      '✅ Tesla & Calendar 데이터 동기화 완료'
+    );
+
+    console.log(
+      `🚗 vehicle: ${summary.vehicle}`
+    );
+
+    console.log(
+      `🛣️ driving: ${summary.driving}`
+    );
+
+    console.log(
+      `🔋 charging: ${summary.charging}`
+    );
+
+    console.log(
+      `📅 calendar: ${summary.calendar}`
+    );
+
+    console.log(
+      '============================================'
+    );
 
     return res.status(200).json({
 
       success: true,
 
       message:
-        'Fast sync done',
+        '동기화 완료',
 
-      summary
+      summary,
+
+      debug: debugInfo
 
     });
-
 
   } catch (err) {
 
     console.error(
-      '❌ Fast Sync Error:',
+      '❌ Sync Error:',
       err.message
     );
 
+    console.error(err.stack);
 
     return res.status(500).json({
 
       success: false,
 
-      error:
-        err.message
+      error: err.message
 
     });
   }
-};
+}
+
+module.exports = handler;
