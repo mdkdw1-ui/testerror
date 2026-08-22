@@ -1,340 +1,476 @@
-package com.example.expcalculator
+package com.example.tesladash
 
-import android.app.*
-import android.content.*
-import android.graphics.*
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.ImageReader
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.*
+import android.os.Build
+import android.os.Bundle
 import android.provider.Settings
-import android.view.*
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
-import androidx.activity.result.contract.ActivityResultContracts
+import android.util.Log
+import android.webkit.*
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.NotificationCompat
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import java.nio.ByteBuffer
-import java.util.regex.Pattern
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.google.firebase.messaging.FirebaseMessaging
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import org.json.JSONObject
+import java.io.IOException
 
-// ==========================================
-// 1. 메인 액티비티 (권한 요청 및 서비스 시작)
-// ==========================================
 class MainActivity : AppCompatActivity() {
 
-    private val mediaProjectionManager by lazy {
-        getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-    }
+    private lateinit var webView: WebView
+    private val client = OkHttpClient()
+    private var keepAliveJob: Thread? = null
+    private var isKeepAliveRunning = false
 
-    private val captureLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == RESULT_OK && result.data != null) {
-            // 화면 캡처 권한 승인 시 서비스 시작
-            val intent = Intent(this, ExpOverlayService::class.java).apply {
-                putExtra("RESULT_CODE", result.resultCode)
-                putExtra("DATA_INTENT", result.data)
+    private val cachedHtmlContent: String by lazy {
+        assets.open("index.html")
+            .bufferedReader(Charsets.UTF_8)
+            .use { it.readText() }
+    }
+    private var pendingOAuthCode: String? = null
+    private var lastProcessedCode: String? = null
+    private var accessToken: String = ""
+
+    companion object {
+        private const val TAG = "TeslaDash"
+        private const val RENDER_BASE_URL = "https://tesla-sentry.onrender.com"
+        private const val BASE_URL = "https://mdkdw1-ui.github.io/tesla-dash"
+        private const val OVERLAY_PERMISSION_REQ_CODE = 1234
+        
+        private const val TESLA_CLIENT_ID = "272ac00a-248e-4fa7-8027-1fc06e8e9a24"
+        private const val REDIRECT_URI = "https://tesla-sync-api.vercel.app/api/callback"
+        
+        private var mainActivityInstance: MainActivity? = null
+
+        fun injectFcmToken(token: String) {
+            mainActivityInstance?.runOnUiThread {
+                mainActivityInstance?.webView?.evaluateJavascript(
+                    "window.fcmToken = '$token'; console.log('✅ FCM Token injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
+                    null
+                )
+                Log.d(TAG, "✅ FCM Token injected: $token")
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-            finish() // 액티비티 종료 후 게임으로 복귀 준비
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        mainActivityInstance = this
 
-        // 메인 UI (권한 실행 버튼)
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(50, 50, 50, 50)
+        // 1. 알림 권한 요청 (Android 13+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    1001
+                )
+            }
         }
 
-        val btnStart = Button(this).apply {
-            text = "경험치 오버레이 시작하기"
-            setOnClickListener { checkPermissionsAndStart() }
+        // 2. 다른 앱 위에 그리기 권한 요청
+        checkOverlayPermission()
+
+        webView = WebView(this)
+        setContentView(webView)
+        
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            allowFileAccess = false
+            allowContentAccess = false
+            allowFileAccessFromFileURLs = false
+            allowUniversalAccessFromFileURLs = false
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            
+            setSupportZoom(true)
+            builtInZoomControls = true
+            displayZoomControls = false
+            loadWithOverviewMode = true
+            useWideViewPort = true
+            cacheMode = WebSettings.LOAD_DEFAULT
+            setSupportMultipleWindows(false)
         }
 
-        layout.addView(btnStart)
-        setContentView(layout)
-    }
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-    private fun checkPermissionsAndStart() {
-        // 다른 앱 위에 그리기 권한 확인
-        if (!Settings.canDrawOverlays(this)) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            startActivity(intent)
-            return
-        }
-        // 화면 캡처 권한 요청
-        captureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
-    }
-}
+        webView.addJavascriptInterface(AndroidBridge(), "AndroidBridge")
 
-// ==========================================
-// 2. 오버레이 & OCR 경험치 계산 서비스
-// ==========================================
-class ExpOverlayService : Service() {
+        webView.webViewClient = object : WebViewClient() {
 
-    private lateinit var windowManager: WindowManager
-    private var overlayView: View? = null
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return false
+                Log.d(TAG, "🌐 shouldOverrideUrlLoading: $url")
 
-    private var mediaProjection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-
-    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    private val handler = Handler(Looper.getMainLooper())
-
-    private var isMeasuring = false
-    private var startTimeMs = 0L
-    private var startExpSum = 0L
-
-    private lateinit var tvStatus: TextView
-    private lateinit var btnToggle: Button
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onCreate() {
-        super.onCreate()
-        startForegroundNotification()
-        setupOverlayView()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
-        val dataIntent = intent?.getParcelableExtra<Intent>("DATA_INTENT")
-
-        if (resultCode == Activity.RESULT_OK && dataIntent != null) {
-            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(resultCode, dataIntent)
-            setupVirtualDisplay()
-        }
-        return START_NOT_STICKY
-    }
-
-    // ------------------------------------------
-    // 플로팅 오버레이 UI 생성 (드래그 가능)
-    // ------------------------------------------
-    private fun setupOverlayView() {
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(200, 0, 0, 0)) // 반투명 검은색 배경
-            setPadding(20, 20, 20, 20)
-        }
-
-        tvStatus = TextView(this).apply {
-            text = "분당 EXP: 대기중..."
-            setTextColor(Color.WHITE)
-            textSize = 14f
-        }
-
-        btnToggle = Button(this).apply {
-            text = "측정 시작"
-            textSize = 12f
-            setOnClickListener { toggleMeasurement() }
-        }
-
-        container.addView(tvStatus)
-        container.addView(btnToggle)
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 100
-            y = 300
-        }
-
-        // 터치 및 드래그 이동 처리
-        container.setOnTouchListener(object : View.OnTouchListener {
-            private var initialX = 0
-            private var initialY = 0
-            private var initialTouchX = 0f
-            private var initialTouchY = 0f
-
-            override fun onTouch(v: View?, event: MotionEvent): Boolean {
-                when (event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        initialX = params.x
-                        initialY = params.y
-                        initialTouchX = event.rawX
-                        initialTouchY = event.rawY
-                        return true
+                if (url.startsWith("https://tesla-sync-api.vercel.app/api/callback")) {
+                    val code = extractCodeFromUrl(url)
+                    if (!code.isNullOrEmpty()) {
+                        exchangeTokenWithVercel(code)
+                    } else {
+                        showErrorOnScreen("Callback URL에서 인증 코드를 찾을 수 없습니다.")
                     }
-                    MotionEvent.ACTION_MOVE -> {
-                        params.x = initialX + (event.rawX - initialTouchX).toInt()
-                        params.y = initialY + (event.rawY - initialTouchY).toInt()
-                        windowManager.updateViewLayout(container, params)
-                        return true
-                    }
+                    return true
                 }
                 return false
             }
-        })
 
-        overlayView = container
-        windowManager.addView(overlayView, params)
-    }
-
-    // ------------------------------------------
-    // 미디어 프로젝션 및 화면 캡처 설정
-    // ------------------------------------------
-    private fun setupVirtualDisplay() {
-        val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "ExpCapture",
-            width, height, metrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, null
-        )
-    }
-
-    // ------------------------------------------
-    // 경험치 측정 토글 및 주기적 계산
-    // ------------------------------------------
-    private fun toggleMeasurement() {
-        if (!isMeasuring) {
-            isMeasuring = true
-            startTimeMs = System.currentTimeMillis()
-            startExpSum = -1L // 첫 캡처 시 초기값 수집
-            btnToggle.text = "중지"
-            tvStatus.text = "스캔 중..."
-            handler.post(captureRunnable)
-        } else {
-            isMeasuring = false
-            btnToggle.text = "측정 시작"
-            handler.removeCallbacks(captureRunnable)
-        }
-    }
-
-    private val captureRunnable = object : Runnable {
-        override fun run() {
-            if (!isMeasuring) return
-            processScreenCapture()
-            handler.postDelayed(this, 5000) // 5초 간격 주기적 측정
-        }
-    }
-
-    private fun processScreenCapture() {
-        val image = imageReader?.acquireLatestImage() ?: return
-        val planes = image.planes
-        val buffer: ByteBuffer = planes[0].buffer
-        val pixelStride = planes[0].pixelStride
-        val rowStride = planes[0].rowStride
-        val rowPadding = rowStride - pixelStride * image.width
-
-        val bitmap = Bitmap.createBitmap(
-            image.width + rowPadding / pixelStride,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
-        bitmap.copyPixelsFromBuffer(buffer)
-        image.close()
-
-        // 화면 좌측 하단(경험치 표시 영역) Crop: Y축 80%~100%, X축 0%~40%
-        val cropX = 0
-        val cropY = (bitmap.height * 0.80).toInt()
-        val cropW = (bitmap.width * 0.40).toInt()
-        val cropH = (bitmap.height * 0.20).toInt()
-
-        val croppedBitmap = Bitmap.createBitmap(bitmap, cropX, cropY, cropW, cropH)
-
-        // ML Kit OCR 수행
-        val inputImage = InputImage.fromBitmap(croppedBitmap, 0)
-        recognizer.process(inputImage)
-            .addOnSuccessListener { visionText ->
-                parseAndCalculateExp(visionText.text)
+            // 🔥 웹뷰 내부 네트워크/리소스 오류 발생 시 화면에 출력
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame == true) {
+                    val msg = "웹 로딩 에러 [코드 ${error?.errorCode}]: ${error?.description}"
+                    showErrorOnScreen(msg)
+                }
             }
+
+            // 🔥 HTTP 에러 응답(404, 500 등) 감지 시 화면에 출력
+            override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                if (request?.isForMainFrame == true) {
+                    val msg = "HTTP 에러 [상태코드 ${errorResponse?.statusCode}]: ${errorResponse?.reasonPhrase}"
+                    showErrorOnScreen(msg)
+                }
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+
+                if (url != null && url.contains("code=") && url.contains("tesla-sync-api.vercel.app")) {
+                    val code = extractCodeFromUrl(url)
+                    if (code != null && code != lastProcessedCode) {
+                        exchangeTokenWithVercel(code)
+                        return
+                    }
+                }
+
+                pendingOAuthCode?.let { code ->
+                    webView.evaluateJavascript(
+                        "if (typeof addLog === 'function') addLog('🔐 로그인 코드 처리 중: ${code.take(10)}...');" +
+                        "if (typeof window.handleOAuthCode === 'function') { window.handleOAuthCode('$code'); }",
+                        null
+                    )
+                    pendingOAuthCode = null
+                }
+
+                FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+                    if (task.isSuccessful) {
+                        task.result?.let { token ->
+                            view?.evaluateJavascript(
+                                "window.fcmToken = '$token'; console.log('🔄 FCM Token re-injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
+                                null
+                            )
+                        }
+                    }
+                }
+            }
+
+            private fun extractCodeFromUrl(url: String): String? {
+                return try {
+                    val uri = Uri.parse(url)
+                    uri.getQueryParameter("code")
+                } catch (e: Exception) {
+                    showErrorOnScreen("URL 파싱 실패: ${e.message}")
+                    null
+                }
+            }
+        }
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
+                consoleMessage?.let {
+                    Log.d(TAG, "🌐 Console: ${it.message()}")
+                    // JS 콘솔 오류 중 Error 단어가 포함된 경우 화면에 표시
+                    if (it.messageLevel() == WebChromeClient.ConsoleMessage.MessageLevel.ERROR) {
+                        showErrorOnScreen("JS Error: ${it.message()}")
+                    }
+                }
+                return super.onConsoleMessage(consoleMessage)
+            }
+        }
+
+        val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
+        accessToken = prefs.getString("access_token", "") ?: ""
+
+        webView.loadDataWithBaseURL(
+            BASE_URL,
+            cachedHtmlContent,
+            "text/html",
+            "UTF-8",
+            null
+        )
+
+        if (accessToken.isNotEmpty()) {
+            webView.postDelayed({
+                injectTokenToWebView(accessToken)
+            }, 500)
+        }
+
+        FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                task.result?.let { token ->
+                    webView.evaluateJavascript(
+                        "window.fcmToken = '$token'; console.log('🔑 FCM Token pre-injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
+                        null
+                    )
+                }
+            }
+        }
+
+        intent?.data?.let { uri -> handleDeepLink(uri) }
     }
 
-    // ------------------------------------------
-    // 텍스트 파싱 ("354 (+34)" 형태 숫자 합산 및 계산)
-    // ------------------------------------------
-    private fun parseAndCalculateExp(rawText: String) {
-        val matcher = Pattern.compile("\\d+").matcher(rawText)
-        val numbers = mutableListOf<Long>()
-        while (matcher.find()) {
-            numbers.add(matcher.group().toLong())
-        }
-
-        if (numbers.isEmpty()) return
-
-        // 354 (+34) 형태에서 추출된 숫자들을 합산 (예: 354 + 34 = 388)
-        val currentExpSum = numbers.sum()
-
-        if (startExpSum < 0) {
-            startExpSum = currentExpSum
-            tvStatus.text = "기준점 설정 완료\n($currentExpSum)"
-            return
-        }
-
-        val elapsedSec = (System.currentTimeMillis() - startTimeMs) / 1000
-        if (elapsedSec > 0) {
-            val gainedExp = currentExpSum - startExpSum
-            // 분당 경험치 공식 = (획득 경험치 / 경과 초) * 60
-            val expPerMin = (gainedExp.toDouble() / elapsedSec) * 60
-
-            tvStatus.text = "분당 EXP: ${expPerMin.toInt()}\n(획득: +$gainedExp / ${elapsedSec}초)"
+    // 🔥 다른 앱 위에 그리기 권한 확인 및 설정 화면 이동
+    private fun checkOverlayPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "백그라운드 팝업 동작을 위해 '다른 앱 위에 그리기' 권한이 필요합니다.", Toast.LENGTH_LONG).show()
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                startActivityForResult(intent, OVERLAY_PERMISSION_REQ_CODE)
+            }
         }
     }
 
-    // ------------------------------------------
-    // 포그라운드 서비스 알림 설정
-    // ------------------------------------------
-    private fun startForegroundNotification() {
-        val channelId = "exp_overlay_channel"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId, "경험치 오버레이",
-                NotificationManager.IMPORTANCE_LOW
+    // 🔥 에러 메시지를 화면 Toast 및 WebView 콘솔 영역에 노출하는 통합 함수
+    private fun showErrorOnScreen(errorMessage: String) {
+        runOnUiThread {
+            Log.e(TAG, "❌ [ScreenError] $errorMessage")
+            Toast.makeText(this, "⚠️ $errorMessage", Toast.LENGTH_LONG).show()
+            
+            val safeMsg = errorMessage.replace("'", "\\'").replace("\n", " ")
+            webView.evaluateJavascript(
+                "if (typeof addLog === 'function') { addLog('❌ $safeMsg'); } " +
+                "else { console.error('❌ $safeMsg'); }",
+                null
             )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        intent?.data?.let { uri -> handleDeepLink(uri) }
+    }
+
+    private fun handleDeepLink(uri: Uri) {
+        val code = uri.getQueryParameter("code")
+        if (code != null && code != lastProcessedCode) {
+            exchangeTokenWithVercel(code)
+        }
+    }
+
+    private fun exchangeTokenWithVercel(code: String) {
+        if (code == lastProcessedCode) return
+        lastProcessedCode = code
+
+        showToast("🔄 토큰 교환 중...")
+
+        val json = JSONObject().apply {
+            put("code", code)
+            put("redirect_uri", REDIRECT_URI)
         }
 
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("제2의나라 경험치 계산기")
-            .setContentText("오버레이가 실행 중입니다.")
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val body = RequestBody.create(mediaType, json.toString())
+
+        val request = Request.Builder()
+            .url("https://tesla-sync-api.vercel.app/api/exchange")
+            .post(body)
             .build()
 
-        startForeground(1, notification)
+        client.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                // 🔥 네트워크 실패 시 화면에 에러 출력
+                showErrorOnScreen("Vercel 통신 실패: ${e.message}")
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val responseBody = response.body?.string() ?: ""
+
+                if (response.isSuccessful) {
+                    try {
+                        val jsonRes = JSONObject(responseBody)
+                        val token = jsonRes.getString("access_token")
+                        val refreshToken = jsonRes.optString("refresh_token", "")
+                        
+                        accessToken = token
+
+                        val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
+                        prefs.edit().putString("access_token", token).apply()
+                        if (refreshToken.isNotEmpty()) {
+                            prefs.edit().putString("refresh_token", refreshToken).apply()
+                        }
+
+                        syncTokensToRender(token, refreshToken)
+
+                        runOnUiThread {
+                            webView.loadDataWithBaseURL(
+                                BASE_URL,
+                                cachedHtmlContent,
+                                "text/html",
+                                "UTF-8",
+                                null
+                            )
+                            webView.postDelayed({
+                                injectTokenToWebView(token)
+                                showToast("✅ 로그인 성공!")
+                            }, 1000)
+                        }
+
+                    } catch (e: Exception) {
+                        // 🔥 파싱 오류 발생 시 응답 파라미터와 함께 에러 출력
+                        showErrorOnScreen("토큰 파싱 에러 [응답: $responseBody]: ${e.message}")
+                    }
+                } else {
+                    // 🔥 HTTP 상태코드 에러 출력 (예: 400, 401, 500)
+                    showErrorOnScreen("토큰 교환 실패 [HTTP ${response.code}]: $responseBody")
+                }
+            }
+        })
+    }
+
+    private fun syncTokensToRender(accessToken: String, refreshToken: String) {
+        if (RENDER_BASE_URL.contains("<YOUR-RENDER-APP>")) return
+        
+        val json = JSONObject().apply {
+            put("accessToken", accessToken)
+            put("refreshToken", refreshToken)
+        }
+
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val body = RequestBody.create(mediaType, json.toString())
+
+        val request = Request.Builder()
+            .url("$RENDER_BASE_URL/api/token")
+            .post(body)
+            .build()
+
+        client.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                showErrorOnScreen("Render 동기화 실패: ${e.message}")
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (!response.isSuccessful) {
+                    showErrorOnScreen("Render 동기화 에러 [코드 ${response.code}]")
+                }
+                response.body?.close()
+            }
+        })
+    }
+
+    private fun injectTokenToWebView(token: String) {
+        webView.postDelayed({
+            val js = """
+                (function() {
+                    window.accessToken = '$token';
+                    localStorage.setItem('tesla_access_token', '$token');
+                    if (typeof window.handleOAuthCodeDirect === 'function') {
+                        window.handleOAuthCodeDirect('$token', '');
+                    } else {
+                        var loginSection = document.getElementById('loginSection');
+                        var tokenSection = document.getElementById('tokenInfoSection');
+                        var displayToken = document.getElementById('displayAccessToken');
+                        
+                        if (loginSection) loginSection.classList.add('hidden');
+                        if (tokenSection) tokenSection.classList.remove('hidden');
+                        if (displayToken) displayToken.innerText = '$token';
+                        
+                        if (typeof fetchTeslaVehicles === 'function') {
+                            fetchTeslaVehicles('$token', true);
+                        }
+                        if (typeof handleRefresh === 'function') {
+                            handleRefresh(false);
+                        }
+                    }
+                })();
+            """.trimIndent()
+
+            webView.evaluateJavascript(js, null)
+        }, 500)
+    }
+
+    private fun showToast(message: String) {
+        runOnUiThread {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        isMeasuring = false
-        handler.removeCallbacks(captureRunnable)
-        virtualDisplay?.release()
-        mediaProjection?.stop()
-        if (overlayView != null) windowManager.removeView(overlayView)
+        stopKeepAlive()
+        mainActivityInstance = null
+    }
+
+    inner class AndroidBridge {
+        @JavascriptInterface
+        fun startGuardianService(accessToken: String, vehicleId: String, interval: Int, topic: String) {
+            showToast("🛡️ 가디언 시작")
+            startKeepAlive()
+        }
+
+        @JavascriptInterface
+        fun stopGuardianService() {
+            showToast("🛑 가디언 중지")
+            stopKeepAlive()
+        }
+
+        @JavascriptInterface
+        fun sendOAuthCode(code: String) {
+            runOnUiThread { exchangeTokenWithVercel(code) }
+        }
+
+        @JavascriptInterface
+        fun saveToken(token: String, refreshToken: String) {
+            accessToken = token
+            val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
+            prefs.edit().putString("access_token", token).apply()
+            if (refreshToken.isNotEmpty()) {
+                prefs.edit().putString("refresh_token", refreshToken).apply()
+            }
+        }
+
+        @JavascriptInterface
+        fun getToken(): String {
+            val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
+            return prefs.getString("access_token", "") ?: ""
+        }
+
+        @JavascriptInterface
+        fun setVibrationPattern(pattern: String) {
+            runOnUiThread {
+                MyFirebaseMessagingService.resetNotificationChannels(this@MainActivity, pattern)
+            }
+        }
+    }
+
+    private fun startKeepAlive() {
+        if (isKeepAliveRunning) return
+        isKeepAliveRunning = true
+
+        keepAliveJob = Thread {
+            while (isKeepAliveRunning) {
+                try {
+                    val request = Request.Builder().url("$RENDER_BASE_URL/health").build()
+                    client.newCall(request).execute().close()
+                } catch (e: Exception) {
+                    showErrorOnScreen("Keep-Alive 실패: ${e.message}")
+                }
+                Thread.sleep(8 * 60 * 1000L)
+            }
+        }.apply { start() }
+    }
+
+    private fun stopKeepAlive() {
+        isKeepAliveRunning = false
+        keepAliveJob?.interrupt()
+        keepAliveJob = null
     }
 }
