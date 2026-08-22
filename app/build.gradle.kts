@@ -4,11 +4,12 @@ plugins {
 }
 
 android {
-    namespace = "com.example.expcalculator"
+    // 패키지명을 Tesla Dash 코딩에 맞게 변경
+    namespace = "com.example.tesladash"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.expcalculator"
+        applicationId = "com.example.tesladash"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
@@ -48,7 +49,11 @@ android {
 }
 
 dependencies {
-    implementation("com.google.android.gms:play-services-mlkit-text-recognition:19.0.0")
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("com.google.android.material:material:1.11.0")
+
+    // 🔥 Tesla Dash 네트워크 및 FCM 필수 의존성
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.firebase:firebase-messaging-ktx:23.4.0")
 }
