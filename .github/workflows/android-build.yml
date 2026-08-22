@@ -20,10 +20,12 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # Gradle 버전을 안정적인 8.4 버전으로 고정
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
 
-      # gradlew 대신 시스템 gradle 명령어로 바로 빌드
       - name: Build Debug APK
         run: gradle assembleDebug
 
