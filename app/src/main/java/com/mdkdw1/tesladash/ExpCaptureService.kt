@@ -7,9 +7,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.Color
-import android.graphics.PixelFormat
+import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -66,6 +64,7 @@ class ExpCaptureService : Service() {
 
     private lateinit var tvExpPerMin: TextView
     private lateinit var tvTotalExp: TextView
+    private lateinit var tvDebugOcr: TextView
     private lateinit var btnToggle: Button
     private lateinit var btnToggleRoiBox: Button
 
@@ -111,7 +110,7 @@ class ExpCaptureService : Service() {
                 }, handler)
 
                 setupVirtualDisplay()
-                showToastOnMainThread("✅ 초록색 박스를 경험치 글자 위치로 드래그하세요!")
+                showToastOnMainThread("✅ 박스를 경험치 글자 위치로 조절하세요!")
             } else {
                 showToastOnMainThread("🚨 화면 공유 데이터 유실 (Code: $resultCode)")
                 stopSelf()
@@ -152,7 +151,7 @@ class ExpCaptureService : Service() {
 
             val container = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.argb(220, 20, 20, 20))
+                setBackgroundColor(Color.argb(230, 20, 20, 20))
                 setPadding(20, 16, 20, 16)
             }
 
@@ -160,14 +159,22 @@ class ExpCaptureService : Service() {
                 text = "⚡ 분당 XP: 0"
                 setTextColor(Color.YELLOW)
                 textSize = 15f
-                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTypeface(null, Typeface.BOLD)
             }
 
             tvTotalExp = TextView(this).apply {
                 text = "📊 누적: 0 XP (0초)"
                 setTextColor(Color.WHITE)
                 textSize = 12f
-                setPadding(0, 4, 0, 8)
+                setPadding(0, 2, 0, 2)
+            }
+
+            // 실시간 OCR 인식 텍스트 디버그 표시용
+            tvDebugOcr = TextView(this).apply {
+                text = "🔍 OCR 대기 중..."
+                setTextColor(Color.CYAN)
+                textSize = 10f
+                setPadding(0, 0, 0, 8)
             }
 
             // 첫 번째 줄 버튼 (시작/정지, 리셋)
@@ -222,6 +229,7 @@ class ExpCaptureService : Service() {
 
             container.addView(tvExpPerMin)
             container.addView(tvTotalExp)
+            container.addView(tvDebugOcr)
             container.addView(btnRow1)
             container.addView(btnRow2)
 
@@ -257,12 +265,12 @@ class ExpCaptureService : Service() {
         }
     }
 
-    // 2. 사용자가 조절 가능한 초록색 영역 박스 UI
+    // 2. 사용자가 조절 가능한 스캔 영역 박스 UI (투명 배경)
     private fun setupRoiBoxUI() {
         try {
             roiLayoutParams = WindowManager.LayoutParams(
-                550, // 초기 너비 (px)
-                300, // 초기 높이 (px)
+                600, // 초기 너비 (px)
+                220, // 초기 높이 (px)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                 else
@@ -272,39 +280,39 @@ class ExpCaptureService : Service() {
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
                 x = 100
-                y = 1000 // 초기 Y 위치
+                y = 800 // 초기 Y 위치
             }
 
             val container = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 
-                // 초록색 테두리 + 반투명 연두색 배경
+                // ⚠️ 핵심: 캡처할 글자를 가리지 않도록 속은 완전 투명, 테두리만 밝은 청록색 선으로 처리
                 val border = GradientDrawable().apply {
                     setShape(GradientDrawable.RECTANGLE)
-                    setStroke(6, Color.GREEN)
-                    setColor(Color.argb(50, 0, 255, 0))
+                    setStroke(4, Color.parseColor("#00E5FF"))
+                    setColor(Color.TRANSPARENT)
                 }
                 background = border
-                setPadding(10, 10, 10, 10)
+                setPadding(4, 4, 4, 4)
             }
 
             // 상단 레이블 & 크기 조절 컨트롤
             val titleLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                setBackgroundColor(Color.argb(180, 0, 0, 0))
-                setPadding(6, 4, 6, 4)
+                setBackgroundColor(Color.argb(200, 0, 0, 0))
+                setPadding(4, 2, 4, 2)
             }
 
             val tvTitle = TextView(this).apply {
-                text = "🎯 스캔 영역"
-                setTextColor(Color.GREEN)
-                textSize = 10f
-                setTypeface(null, android.graphics.Typeface.BOLD)
+                text = "🎯 영역"
+                setTextColor(Color.parseColor("#00E5FF"))
+                textSize = 9f
+                setTypeface(null, Typeface.BOLD)
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
 
-            val btnWMinus = createSmallButton("가로-") { resizeRoiBox(-50, 0) }
-            val btnWPlus = createSmallButton("가로+") { resizeRoiBox(50, 0) }
+            val btnWMinus = createSmallButton("가로-") { resizeRoiBox(-40, 0) }
+            val btnWPlus = createSmallButton("가로+") { resizeRoiBox(40, 0) }
             val btnHMinus = createSmallButton("세로-") { resizeRoiBox(0, -30) }
             val btnHPlus = createSmallButton("세로+") { resizeRoiBox(0, 30) }
 
@@ -353,12 +361,12 @@ class ExpCaptureService : Service() {
         return Button(this).apply {
             text = textStr
             textSize = 8f
-            setPadding(4, 0, 4, 0)
+            setPadding(2, 0, 2, 0)
             setBackgroundColor(Color.DKGRAY)
             setTextColor(Color.WHITE)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-                60
+                55
             ).apply { setMargins(2, 0, 2, 0) }
             setOnClickListener { onClick() }
         }
@@ -366,8 +374,8 @@ class ExpCaptureService : Service() {
 
     private fun resizeRoiBox(deltaW: Int, deltaH: Int) {
         val params = roiLayoutParams ?: return
-        val newW = (params.width + deltaW).coerceAtLeast(200)
-        val newH = (params.height + deltaH).coerceAtLeast(120)
+        val newW = (params.width + deltaW).coerceAtLeast(150)
+        val newH = (params.height + deltaH).coerceAtLeast(80)
         params.width = newW
         params.height = newH
         roiBoxView?.let { windowManager?.updateViewLayout(it, params) }
@@ -407,6 +415,7 @@ class ExpCaptureService : Service() {
         startTimeMs = if (isMeasuring) System.currentTimeMillis() else 0L
         lastFrameLines = emptySet()
         updateUI(0)
+        tvDebugOcr.text = "🔍 OCR 인식 초기화됨"
         Toast.makeText(this, "측정 데이터 초기화 완료", Toast.LENGTH_SHORT).show()
     }
 
@@ -456,7 +465,7 @@ class ExpCaptureService : Service() {
             bitmap.copyPixelsFromBuffer(buffer)
             image.close()
 
-            // 🎯 사용자가 지정한 초록색 박스의 X, Y, 너비, 높이 좌표로 정확히 크롭
+            // 박스 영역 위치/크기 계산
             val roiParams = roiLayoutParams
             val cropX = (roiParams?.x ?: 0).coerceIn(0, bitmapWidth - 1)
             val cropY = (roiParams?.y ?: 0).coerceIn(0, height - 1)
@@ -471,35 +480,83 @@ class ExpCaptureService : Service() {
             val croppedBitmap = Bitmap.createBitmap(bitmap, cropX, cropY, cropWidth, cropHeight)
             bitmap.recycle()
 
-            val visionImage = InputImage.fromBitmap(croppedBitmap, 0)
+            // 🛠️ 이미지 전처리 1: 2.5배 확대 (작은 폰트 OCR 인식률 극대화)
+            val scaledBitmap = Bitmap.createScaledBitmap(
+                croppedBitmap,
+                cropWidth * 5 / 2,
+                cropHeight * 5 / 2,
+                true
+            )
+            croppedBitmap.recycle()
+
+            // 🛠️ 이미지 전처리 2: 고대비(Contrast Boost) 필터 (어두운 배경의 작은 글씨를 뚜렷하게)
+            val enhancedBitmap = enhanceImageContrast(scaledBitmap)
+            scaledBitmap.recycle()
+
+            val visionImage = InputImage.fromBitmap(enhancedBitmap, 0)
             textRecognizer.process(visionImage)
                 .addOnSuccessListener { visionText ->
                     processRecognizedText(visionText.text)
+                    enhancedBitmap.recycle()
                 }
                 .addOnFailureListener { e ->
                     Log.e(TAG, "OCR 오류: ${e.message}")
+                    enhancedBitmap.recycle()
                 }
         } catch (e: Exception) {
             Log.e(TAG, "캡처 예외 발생", e)
         }
     }
 
+    // 고대비 전처리
+    private fun enhanceImageContrast(src: Bitmap): Bitmap {
+        val cm = ColorMatrix(floatArrayOf(
+            3.0f, 0.0f, 0.0f, 0.0f, -120.0f, // Red
+            0.0f, 3.0f, 0.0f, 0.0f, -120.0f, // Green
+            0.0f, 0.0f, 3.0f, 0.0f, -120.0f, // Blue
+            0.0f, 0.0f, 0.0f, 1.0f, 0.0f    // Alpha
+        ))
+        val result = Bitmap.createBitmap(src.width, src.height, src.config)
+        val canvas = Canvas(result)
+        val paint = Paint().apply {
+            colorFilter = ColorMatrixColorFilter(cm)
+        }
+        canvas.drawBitmap(src, 0f, 0f, paint)
+        return result
+    }
+
     private fun processRecognizedText(recognizedText: String) {
-        val currentLines = recognizedText.lines()
+        val lines = recognizedText.lines()
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
-        val newLines = currentLines.filter { !lastFrameLines.contains(it) }
+        if (lines.isEmpty()) {
+            tvDebugOcr.text = "🔍 OCR 인식: (텍스트 없음)"
+            return
+        }
+
+        // 실시간 인식 디버그 라인 업데이트
+        val firstLinePreview = lines.firstOrNull()?.replace("\n", " ") ?: ""
+        tvDebugOcr.text = "🔍 OCR: ${if (firstLinePreview.length > 20) firstLinePreview.substring(0, 20) + "..." else firstLinePreview}"
+
+        val newLines = lines.filter { !lastFrameLines.contains(it) }
 
         var frameGainedExp = 0L
-        val regex = Regex("(\\d+)\\D+(\\d+)")
 
         for (line in newLines) {
-            val match = regex.find(line)
-            if (match != null) {
-                val baseExp = match.groupValues[1].toLongOrNull() ?: 0L
-                val bonusExp = match.groupValues[2].toLongOrNull() ?: 0L
-                frameGainedExp += (baseExp + bonusExp)
+            // 쉼표 제거 (EXP +3,194(+1,055) -> EXP +3194(+1055))
+            val cleanLine = line.replace(",", "")
+            
+            // EXP 키워드가 있거나 숫자 패턴이 있는 경우
+            if (cleanLine.contains("EXP", ignoreCase = true) || cleanLine.contains("EX", ignoreCase = true) || cleanLine.contains("+")) {
+                val numbers = Regex("\\d+").findAll(cleanLine).mapNotNull { it.value.toLongOrNull() }.toList()
+                if (numbers.isNotEmpty()) {
+                    // 한 줄에 나타난 모든 경험치 숫자(기본+보너스) 합산
+                    val sumInLine = numbers.sum()
+                    if (sumInLine in 10..5000000) { // 정상 경험치 범위
+                        frameGainedExp += sumInLine
+                    }
+                }
             }
         }
 
@@ -507,7 +564,7 @@ class ExpCaptureService : Service() {
             totalExpAccumulated += frameGainedExp
         }
 
-        lastFrameLines = currentLines.toSet()
+        lastFrameLines = lines.toSet()
         updateUI(frameGainedExp)
     }
 
@@ -522,7 +579,7 @@ class ExpCaptureService : Service() {
     private fun startForegroundServiceNotification() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("제2 경험치 측정 동작 중")
-            .setContentText("초록색 박스를 스캔할 영역으로 맞추세요.")
+            .setContentText("스캔 박스를 경험치 위치로 맞추세요.")
             .setSmallIcon(android.R.drawable.sym_def_app_icon)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
