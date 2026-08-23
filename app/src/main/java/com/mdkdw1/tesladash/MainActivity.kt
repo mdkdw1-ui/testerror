@@ -27,21 +27,24 @@ class MainActivity : AppCompatActivity() {
     private var isKeepAliveRunning = false
 
     private val cachedHtmlContent: String by lazy {
-        assets.open("index.html")
-            .bufferedReader(Charsets.UTF_8)
-            .use { it.readText() }
+        try {
+            assets.open("index.html")
+                .bufferedReader(Charsets.UTF_8)
+                .use { it.readText() }
+        } catch (e: Exception) {
+            "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><h2>제2 경험치</h2><p>index.html 로딩 중 오류가 발생했습니다.</p></body></html>"
+        }
     }
     private var pendingOAuthCode: String? = null
     private var lastProcessedCode: String? = null
     private var accessToken: String = ""
 
     companion object {
-        private const val TAG = "TeslaDash"
+        private const val TAG = "ExpCalculator"
         private const val RENDER_BASE_URL = "https://tesla-sentry.onrender.com"
         private const val BASE_URL = "https://mdkdw1-ui.github.io/tesla-dash"
         private const val OVERLAY_PERMISSION_REQ_CODE = 1234
         
-        private const val TESLA_CLIENT_ID = "272ac00a-248e-4fa7-8027-1fc06e8e9a24"
         private const val REDIRECT_URI = "https://tesla-sync-api.vercel.app/api/callback"
         
         private var mainActivityInstance: MainActivity? = null
@@ -49,10 +52,9 @@ class MainActivity : AppCompatActivity() {
         fun injectFcmToken(token: String) {
             mainActivityInstance?.runOnUiThread {
                 mainActivityInstance?.webView?.evaluateJavascript(
-                    "window.fcmToken = '$token'; console.log('✅ FCM Token injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
+                    "window.fcmToken = '$token'; console.log('✅ FCM Token injected');",
                     null
                 )
-                Log.d(TAG, "✅ FCM Token injected: $token")
             }
         }
     }
@@ -86,15 +88,20 @@ class MainActivity : AppCompatActivity() {
             null
         )
 
-        FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
-            if (task.isSuccessful) {
-                task.result?.let { token ->
-                    webView.evaluateJavascript(
-                        "window.fcmToken = '$token'; console.log('🔑 FCM Token pre-injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
-                        null
-                    )
+        // Firebase 초기화 실패 시 튕김 방지 (try-catch 예외 처리)
+        try {
+            FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+                if (task.isSuccessful) {
+                    task.result?.let { token ->
+                        webView.evaluateJavascript(
+                            "window.fcmToken = '$token'; console.log('🔑 FCM Token pre-injected');",
+                            null
+                        )
+                    }
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Firebase 초기화 건너뜀: ${e.message}")
         }
     }
 
@@ -167,7 +174,6 @@ class MainActivity : AppCompatActivity() {
     private fun checkOverlayPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (!Settings.canDrawOverlays(this)) {
-                Toast.makeText(this, "백그라운드 팝업을 위해 '다른 앱 위에 그리기' 권한이 필요합니다.", Toast.LENGTH_LONG).show()
                 val intent = Intent(
                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                     Uri.parse("package:$packageName")
@@ -183,9 +189,7 @@ class MainActivity : AppCompatActivity() {
             OVERLAY_PERMISSION_REQ_CODE -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     if (Settings.canDrawOverlays(this)) {
-                        Toast.makeText(this, "✅ 다른 앱 위에 그리기 권한이 허용되었습니다.", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(this, "⚠️ 권한이 거부되었습니다.", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "✅ 권한이 허용되었습니다.", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
@@ -255,9 +259,6 @@ class MainActivity : AppCompatActivity() {
                 (function() {
                     window.accessToken = '$token';
                     localStorage.setItem('tesla_access_token', '$token');
-                    if (typeof window.handleOAuthCodeDirect === 'function') {
-                        window.handleOAuthCodeDirect('$token', '');
-                    }
                 })();
             """.trimIndent()
             webView.evaluateJavascript(js, null)
@@ -270,16 +271,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     inner class AndroidBridge {
-        @JavascriptInterface
-        fun startGuardianService(accessToken: String, vehicleId: String, interval: Int, topic: String) {
-            Toast.makeText(this@MainActivity, "🛡️ 가디언 시작", Toast.LENGTH_SHORT).show()
-        }
-
-        @JavascriptInterface
-        fun stopGuardianService() {
-            Toast.makeText(this@MainActivity, "🛑 가디언 중지", Toast.LENGTH_SHORT).show()
-        }
-
         @JavascriptInterface
         fun sendOAuthCode(code: String) {
             runOnUiThread { exchangeTokenWithVercel(code) }
