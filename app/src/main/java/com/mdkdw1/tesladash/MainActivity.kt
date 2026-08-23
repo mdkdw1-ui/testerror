@@ -19,7 +19,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.nio.ByteBuffer
 
 class MainActivity : AppCompatActivity() {
@@ -30,7 +30,7 @@ class MainActivity : AppCompatActivity() {
     private var imageReader: ImageReader? = null
 
     private val SCREEN_CAPTURE_REQUEST_CODE = 1000
-    private val textRecognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+    private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
     private lateinit var tvResult: TextView
 
@@ -108,6 +108,7 @@ class MainActivity : AppCompatActivity() {
         bitmap.copyPixelsFromBuffer(buffer)
         image.close()
 
+        // 왼쪽 아래 영역 크롭 (가로 0~40%, 세로 60~100%)
         val cropX = 0
         val cropY = (height * 0.6).toInt()
         val cropWidth = (width * 0.4).toInt()
@@ -134,7 +135,7 @@ class MainActivity : AppCompatActivity() {
             val baseExp = matchResult.groupValues[1].toInt()
             val bonusExp = matchResult.groupValues[2].toInt()
             val totalExp = baseExp + bonusExp
-            tvResult.text = "인식 성공!\n- 기본 경험치: $baseExp\n- 보너스 경험치: $bonusExp\n- 총 효율: $totalExp"
+            tvResult.text = "인식 성공!\n- 기본 경험치: $baseExp\n- 보너스 경험치: $bonusExp\n- 총 합산: $totalExp"
         } else {
             tvResult.text = "숫자를 찾지 못했습니다.\n인식된 텍스트: $recognizedText"
         }
