@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -63,28 +64,46 @@ class ExpCaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        setupOverlayUI()
+        try {
+            createNotificationChannel()
+            // 안드로이드 14 필수: Service 생성 직후 가장 먼저 포그라운드 전환 선언
+            startForegroundServiceNotification()
+            setupOverlayUI()
+        } catch (e: Exception) {
+            Log.e(TAG, "Service onCreate 에러: ${e.message}", e)
+            showToastOnMainThread("서비스 초기화 에러: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
-        val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent?.getParcelableExtra("RESULT_DATA", Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent?.getParcelableExtra("RESULT_DATA")
-        }
+        try {
+            val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
+            val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent?.getParcelableExtra("RESULT_DATA", Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent?.getParcelableExtra("RESULT_DATA")
+            }
 
-        if (resultCode == Activity.RESULT_OK && resultData != null) {
-            startForegroundServiceNotification()
+            if (resultCode == Activity.RESULT_OK && resultData != null) {
+                val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
 
-            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
+                if (mediaProjection == null) {
+                    showToastOnMainThread("🚨 MediaProjection 생성 실패 (null)")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
 
-            setupVirtualDisplay()
-        } else {
-            Toast.makeText(this, "화면 공유 권한이 전달되지 않았습니다.", Toast.LENGTH_SHORT).show()
+                setupVirtualDisplay()
+                showToastOnMainThread("✅ 오버레이 창 구동 성공! 게임 화면으로 이동하세요.")
+            } else {
+                showToastOnMainThread("🚨 화면 공유 데이터 유실 (Code: $resultCode)")
+                stopSelf()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "onStartCommand 에러: ${e.message}", e)
+            showToastOnMainThread("🚨 서비스 구동 실패: ${e.javaClass.simpleName} - ${e.message}")
             stopSelf()
         }
 
@@ -92,101 +111,107 @@ class ExpCaptureService : Service() {
     }
 
     private fun setupOverlayUI() {
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-        val layoutParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 100
-            y = 300
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            showToastOnMainThread("🚨 오버레이 권한이 비활성화되어 있습니다.")
+            return
         }
 
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.argb(220, 20, 20, 20))
-            setPadding(24, 20, 24, 20)
-        }
+        try {
+            windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
-        tvExpPerMin = TextView(this).apply {
-            text = "⚡ 분당 XP: 0"
-            setTextColor(Color.YELLOW)
-            textSize = 15f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-        }
-
-        tvTotalExp = TextView(this).apply {
-            text = "📊 누적: 0 XP (0초)"
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            setPadding(0, 4, 0, 12)
-        }
-
-        val btnLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        btnToggle = Button(this).apply {
-            text = "▶ 측정 시작"
-            textSize = 12f
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                toggleMeasurement()
+            val layoutParams = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                else
+                    @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 100
+                y = 300
             }
-        }
 
-        val btnReset = Button(this).apply {
-            text = "🔄 리셋"
-            textSize = 12f
-            setBackgroundColor(Color.parseColor("#757575"))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                resetData()
+            val container = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.argb(220, 20, 20, 20))
+                setPadding(24, 20, 24, 20)
             }
-        }
 
-        btnLayout.addView(btnToggle)
-        btnLayout.addView(btnReset)
+            tvExpPerMin = TextView(this).apply {
+                text = "⚡ 분당 XP: 0"
+                setTextColor(Color.YELLOW)
+                textSize = 15f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            }
 
-        container.addView(tvExpPerMin)
-        container.addView(tvTotalExp)
-        container.addView(btnLayout)
+            tvTotalExp = TextView(this).apply {
+                text = "📊 누적: 0 XP (0초)"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                setPadding(0, 4, 0, 12)
+            }
 
-        // 드래그 이동 기능
-        var initialX = 0
-        var initialY = 0
-        var initialTouchX = 0f
-        var initialTouchY = 0f
+            val btnLayout = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
 
-        container.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initialX = layoutParams.x
-                    initialY = layoutParams.y
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    true
+            btnToggle = Button(this).apply {
+                text = "▶ 측정 시작"
+                textSize = 12f
+                setBackgroundColor(Color.parseColor("#4CAF50"))
+                setTextColor(Color.WHITE)
+                setOnClickListener { toggleMeasurement() }
+            }
+
+            val btnReset = Button(this).apply {
+                text = "🔄 리셋"
+                textSize = 12f
+                setBackgroundColor(Color.parseColor("#757575"))
+                setTextColor(Color.WHITE)
+                setOnClickListener { resetData() }
+            }
+
+            btnLayout.addView(btnToggle)
+            btnLayout.addView(btnReset)
+
+            container.addView(tvExpPerMin)
+            container.addView(tvTotalExp)
+            container.addView(btnLayout)
+
+            // 드래그 기능
+            var initialX = 0
+            var initialY = 0
+            var initialTouchX = 0f
+            var initialTouchY = 0f
+
+            container.setOnTouchListener { _, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        initialX = layoutParams.x
+                        initialY = layoutParams.y
+                        initialTouchX = event.rawX
+                        initialTouchY = event.rawY
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
+                        layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
+                        windowManager?.updateViewLayout(container, layoutParams)
+                        true
+                    }
+                    else -> false
                 }
-                MotionEvent.ACTION_MOVE -> {
-                    layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
-                    layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
-                    windowManager?.updateViewLayout(container, layoutParams)
-                    true
-                }
-                else -> false
             }
-        }
 
-        overlayView = container
-        windowManager?.addView(overlayView, layoutParams)
+            overlayView = container
+            windowManager?.addView(overlayView, layoutParams)
+        } catch (e: Exception) {
+            Log.e(TAG, "오버레이 창 생성 에러: ${e.message}", e)
+            showToastOnMainThread("오버레이 생성 실패: ${e.message}")
+        }
     }
 
     private fun toggleMeasurement() {
@@ -198,12 +223,12 @@ class ExpCaptureService : Service() {
             btnToggle.text = "⏹ 정지"
             btnToggle.setBackgroundColor(Color.parseColor("#F44336"))
             handler.post(captureRunnable)
-            Toast.makeText(this, "경험치 측정이 시작되었습니다.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "경험치 측정 시작", Toast.LENGTH_SHORT).show()
         } else {
             btnToggle.text = "▶ 다시 시작"
             btnToggle.setBackgroundColor(Color.parseColor("#4CAF50"))
             handler.removeCallbacks(captureRunnable)
-            Toast.makeText(this, "측정이 일시정지 되었습니다.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "측정 일시정지", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -212,31 +237,36 @@ class ExpCaptureService : Service() {
         startTimeMs = if (isMeasuring) System.currentTimeMillis() else 0L
         lastFrameLines = emptySet()
         updateUI(0)
-        Toast.makeText(this, "측정 데이터가 초기화되었습니다.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "측정 데이터 초기화 완료", Toast.LENGTH_SHORT).show()
     }
 
     private val captureRunnable = object : Runnable {
         override fun run() {
             if (isMeasuring) {
                 captureAndProcessScreen()
-                handler.postDelayed(this, 1000) // 1초 간격 반복 캡처
+                handler.postDelayed(this, 1000)
             }
         }
     }
 
     private fun setupVirtualDisplay() {
-        val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
+        try {
+            val metrics = resources.displayMetrics
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            val density = metrics.densityDpi
 
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "ExpScreenCapture",
-            width, height, density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, null
-        )
+            imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            virtualDisplay = mediaProjection?.createVirtualDisplay(
+                "ExpScreenCapture",
+                width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader?.surface, null, null
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "VirtualDisplay 생성 실패: ${e.message}", e)
+            showToastOnMainThread("가상 디스플레이 에러: ${e.message}")
+        }
     }
 
     private fun captureAndProcessScreen() {
@@ -256,7 +286,6 @@ class ExpCaptureService : Service() {
             bitmap.copyPixelsFromBuffer(buffer)
             image.close()
 
-            // 가로 모드 화면 좌측 하단 영역 (가로 0~45%, 세로 55~100%) 크롭
             val cropX = 0
             val cropY = (height * 0.55).toInt()
             val cropWidth = (bitmapWidth * 0.45).toInt().coerceAtMost(bitmapWidth)
@@ -274,21 +303,19 @@ class ExpCaptureService : Service() {
                     Log.e(TAG, "OCR 오류: ${e.message}")
                 }
         } catch (e: Exception) {
-            Log.e(TAG, "캡처 루프 예외", e)
+            Log.e(TAG, "캡처 예외 발생", e)
         }
     }
 
     private fun processRecognizedText(recognizedText: String) {
-        // 1. 인식된 문자열을 줄 단위로 분리
         val currentLines = recognizedText.lines()
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
-        // 2. 직전 프레임에 없던 새롭게 추가된 줄만 추출 (잔상/동일 팝업 중복 계산 방지)
         val newLines = currentLines.filter { !lastFrameLines.contains(it) }
 
         var frameGainedExp = 0L
-        val regex = Regex("(\\d+)\\D+(\\d+)") // 예: 344 (+25) 파싱
+        val regex = Regex("(\\d+)\\D+(\\d+)")
 
         for (line in newLines) {
             val match = regex.find(line)
@@ -317,8 +344,8 @@ class ExpCaptureService : Service() {
 
     private fun startForegroundServiceNotification() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("제2 경험치 자동 측정 실행 중")
-            .setContentText("게임 화면 위에 오버레이 계산 창이 표시됩니다.")
+            .setContentTitle("제2 경험치 측정 동작 중")
+            .setContentText("게임 화면 위에 오버레이 위젯이 표시됩니다.")
             .setSmallIcon(android.R.drawable.sym_def_app_icon)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -339,6 +366,12 @@ class ExpCaptureService : Service() {
             )
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
+        }
+    }
+
+    private fun showToastOnMainThread(msg: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
         }
     }
 
