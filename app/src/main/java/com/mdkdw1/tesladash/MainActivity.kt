@@ -176,7 +176,7 @@ class MainActivity : AppCompatActivity() {
         webView.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
                 consoleMessage?.let {
-                    if (it.messageLevel() == WebChromeClient.ConsoleMessage.MessageLevel.ERROR) {
+                    if (it.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) {
                         showErrorOnScreen("JS Error: ${it.message()}")
                     }
                 }
