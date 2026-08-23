@@ -1,15 +1,91 @@
 <!DOCTYPE html>
-<html>
+<html lang="ko">
 <head>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tesla Dash</title>
+    <title>제2 경험치 효율 계산기</title>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            background: #121212; 
+            color: #ffffff; 
+            padding: 16px; 
+            margin: 0; 
+        }
+        h1 { font-size: 1.2rem; color: #4CAF50; margin-bottom: 12px; }
+        .card { 
+            background: #1e1e1e; 
+            padding: 14px; 
+            border-radius: 8px; 
+            margin-bottom: 12px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.4); 
+        }
+        label { font-size: 0.9rem; color: #b0bec5; display: block; margin-top: 8px; }
+        input { 
+            width: 100%; 
+            padding: 10px; 
+            margin-top: 4px; 
+            border-radius: 4px; 
+            border: 1px solid #333; 
+            background: #2d2d2d; 
+            color: #fff; 
+            font-size: 1rem; 
+            box-sizing: border-box; 
+        }
+        button { 
+            width: 100%; 
+            padding: 12px; 
+            margin-top: 12px; 
+            border-radius: 4px; 
+            border: none; 
+            background: #4CAF50; 
+            color: white; 
+            font-weight: bold; 
+            font-size: 1rem; 
+            cursor: pointer; 
+        }
+        button:active { background: #45a049; }
+        .result { 
+            font-size: 1.1rem; 
+            margin-top: 12px; 
+            padding: 10px; 
+            background: #263238; 
+            border-radius: 4px; 
+            color: #FFEB3B; 
+            font-weight: bold; 
+            text-align: center; 
+        }
+    </style>
 </head>
 <body>
-    <h2>Tesla Dash Loaded</h2>
-    <div id="loginSection"><p>로그인 준비 완료</p></div>
-    <div id="tokenInfoSection" class="hidden">
-        <p id="displayAccessToken"></p>
+    <h1>📊 제2 경험치 효율 계산기</h1>
+    <div class="card">
+        <label>기본 경험치 (예: 344)</label>
+        <input type="number" id="baseXp" placeholder="344">
+        
+        <label>추가 경험치 (예: 25)</label>
+        <input type="number" id="bonusXp" placeholder="25">
+        
+        <label>측정 시간 (분 단위)</label>
+        <input type="number" id="minutes" placeholder="1" value="1">
+        
+        <button onclick="calculate()">경험치 효율 계산</button>
+        <div class="result" id="resultText">분당 경험치: 대기 중...</div>
     </div>
+
+    <script>
+        function calculate() {
+            const base = parseFloat(document.getElementById('baseXp').value) || 0;
+            const bonus = parseFloat(document.getElementById('bonusXp').value) || 0;
+            const mins = parseFloat(document.getElementById('minutes').value) || 1;
+            
+            const total = base + bonus;
+            const perMinute = total / mins;
+            
+            document.getElementById('resultText').innerHTML = 
+                `총 획득: ${base} + ${bonus} = ${total} XP<br>` +
+                `⏱ 분당 효율: <strong>${perMinute.toFixed(2)} XP/min</strong>`;
+        }
+    </script>
 </body>
 </html>
