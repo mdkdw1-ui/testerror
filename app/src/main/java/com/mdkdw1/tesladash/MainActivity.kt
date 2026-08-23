@@ -72,11 +72,33 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        checkOverlayPermission()
-
         webView = WebView(this)
         setContentView(webView)
         
+        setupWebView()
+        checkOverlayPermission()
+
+        webView.loadDataWithBaseURL(
+            BASE_URL,
+            cachedHtmlContent,
+            "text/html",
+            "UTF-8",
+            null
+        )
+
+        FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+            if (task.isSuccessful) {
+                task.result?.let { token ->
+                    webView.evaluateJavascript(
+                        "window.fcmToken = '$token'; console.log('🔑 FCM Token pre-injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
+                        null
+                    )
+                }
+            }
+        }
+    }
+
+    private fun setupWebView() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -101,73 +123,32 @@ class MainActivity : AppCompatActivity() {
         webView.addJavascriptInterface(AndroidBridge(), "AndroidBridge")
 
         webView.webViewClient = object : WebViewClient() {
-
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
                 if (url.startsWith("https://tesla-sync-api.vercel.app/api/callback")) {
                     val code = extractCodeFromUrl(url)
                     if (!code.isNullOrEmpty()) {
                         exchangeTokenWithVercel(code)
-                    } else {
-                        showErrorOnScreen("Callback URL에서 인증 코드를 찾을 수 없습니다.")
                     }
                     return true
                 }
                 return false
             }
 
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                super.onReceivedError(view, request, error)
-                if (request?.isForMainFrame == true) {
-                    showErrorOnScreen("웹 로딩 에러 [코드 ${error?.errorCode}]: ${error?.description}")
-                }
-            }
-
-            override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
-                super.onReceivedHttpError(view, request, errorResponse)
-                if (request?.isForMainFrame == true) {
-                    showErrorOnScreen("HTTP 에러 [상태코드 ${errorResponse?.statusCode}]: ${errorResponse?.reasonPhrase}")
-                }
-            }
-
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-
-                if (url != null && url.contains("code=") && url.contains("tesla-sync-api.vercel.app")) {
+                if (url != null && url.contains("code=")) {
                     val code = extractCodeFromUrl(url)
                     if (code != null && code != lastProcessedCode) {
                         exchangeTokenWithVercel(code)
-                        return
-                    }
-                }
-
-                pendingOAuthCode?.let { code ->
-                    webView.evaluateJavascript(
-                        "if (typeof addLog === 'function') addLog('🔐 로그인 코드 처리 중: ${code.take(10)}...');" +
-                        "if (typeof window.handleOAuthCode === 'function') { window.handleOAuthCode('$code'); }",
-                        null
-                    )
-                    pendingOAuthCode = null
-                }
-
-                FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
-                    if (task.isSuccessful) {
-                        task.result?.let { token ->
-                            view?.evaluateJavascript(
-                                "window.fcmToken = '$token'; console.log('🔄 FCM Token re-injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
-                                null
-                            )
-                        }
                     }
                 }
             }
 
             private fun extractCodeFromUrl(url: String): String? {
                 return try {
-                    val uri = Uri.parse(url)
-                    uri.getQueryParameter("code")
+                    Uri.parse(url).getQueryParameter("code")
                 } catch (e: Exception) {
-                    showErrorOnScreen("URL 파싱 실패: ${e.message}")
                     null
                 }
             }
@@ -176,49 +157,17 @@ class MainActivity : AppCompatActivity() {
         webView.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
                 consoleMessage?.let {
-                    if (it.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) {
-                        showErrorOnScreen("JS Error: ${it.message()}")
-                    }
+                    Log.d(TAG, "🌐 Console: ${it.message()}")
                 }
                 return super.onConsoleMessage(consoleMessage)
             }
         }
-
-        val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
-        accessToken = prefs.getString("access_token", "") ?: ""
-
-        webView.loadDataWithBaseURL(
-            BASE_URL,
-            cachedHtmlContent,
-            "text/html",
-            "UTF-8",
-            null
-        )
-
-        if (accessToken.isNotEmpty()) {
-            webView.postDelayed({
-                injectTokenToWebView(accessToken)
-            }, 500)
-        }
-
-        FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
-            if (task.isSuccessful) {
-                task.result?.let { token ->
-                    webView.evaluateJavascript(
-                        "window.fcmToken = '$token'; console.log('🔑 FCM Token pre-injected'); if (typeof onFcmTokenReady === 'function') onFcmTokenReady();",
-                        null
-                    )
-                }
-            }
-        }
-
-        intent?.data?.let { uri -> handleDeepLink(uri) }
     }
 
     private fun checkOverlayPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (!Settings.canDrawOverlays(this)) {
-                Toast.makeText(this, "백그라운드 팝업 동작을 위해 '다른 앱 위에 그리기' 권한이 필요합니다.", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "백그라운드 팝업을 위해 '다른 앱 위에 그리기' 권한이 필요합니다.", Toast.LENGTH_LONG).show()
                 val intent = Intent(
                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                     Uri.parse("package:$packageName")
@@ -228,37 +177,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showErrorOnScreen(errorMessage: String) {
-        runOnUiThread {
-            Log.e(TAG, "❌ [ScreenError] $errorMessage")
-            Toast.makeText(this, "⚠️ $errorMessage", Toast.LENGTH_LONG).show()
-            
-            val safeMsg = errorMessage.replace("'", "\\'").replace("\n", " ")
-            webView.evaluateJavascript(
-                "if (typeof addLog === 'function') { addLog('❌ $safeMsg'); } " +
-                "else { console.error('❌ $safeMsg'); }",
-                null
-            )
-        }
-    }
-
-    override fun onNewIntent(intent: Intent?) {
-        super.onNewIntent(intent)
-        intent?.data?.let { uri -> handleDeepLink(uri) }
-    }
-
-    private fun handleDeepLink(uri: Uri) {
-        val code = uri.getQueryParameter("code")
-        if (code != null && code != lastProcessedCode) {
-            exchangeTokenWithVercel(code)
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        when (requestCode) {
+            OVERLAY_PERMISSION_REQ_CODE -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    if (Settings.canDrawOverlays(this)) {
+                        Toast.makeText(this, "✅ 다른 앱 위에 그리기 권한이 허용되었습니다.", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "⚠️ 권한이 거부되었습니다.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
         }
     }
 
     private fun exchangeTokenWithVercel(code: String) {
         if (code == lastProcessedCode) return
         lastProcessedCode = code
-
-        showToast("🔄 토큰 교환 중...")
 
         val json = JSONObject().apply {
             put("code", code)
@@ -275,27 +211,21 @@ class MainActivity : AppCompatActivity() {
 
         client.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: Call, e: IOException) {
-                showErrorOnScreen("Vercel 통신 실패: ${e.message}")
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "❌ 네트워크 오류", Toast.LENGTH_SHORT).show()
+                }
             }
 
             override fun onResponse(call: Call, response: Response) {
                 val responseBody = response.body?.string() ?: ""
-
                 if (response.isSuccessful) {
                     try {
                         val jsonRes = JSONObject(responseBody)
                         val token = jsonRes.getString("access_token")
-                        val refreshToken = jsonRes.optString("refresh_token", "")
-                        
                         accessToken = token
 
                         val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
                         prefs.edit().putString("access_token", token).apply()
-                        if (refreshToken.isNotEmpty()) {
-                            prefs.edit().putString("refresh_token", refreshToken).apply()
-                        }
-
-                        syncTokensToRender(token, refreshToken)
 
                         runOnUiThread {
                             webView.loadDataWithBaseURL(
@@ -307,46 +237,14 @@ class MainActivity : AppCompatActivity() {
                             )
                             webView.postDelayed({
                                 injectTokenToWebView(token)
-                                showToast("✅ 로그인 성공!")
                             }, 1000)
                         }
-
                     } catch (e: Exception) {
-                        showErrorOnScreen("토큰 파싱 에러 [응답: $responseBody]: ${e.message}")
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "❌ 토큰 파싱 오류", Toast.LENGTH_SHORT).show()
+                        }
                     }
-                } else {
-                    showErrorOnScreen("토큰 교환 실패 [HTTP ${response.code}]: $responseBody")
                 }
-            }
-        })
-    }
-
-    private fun syncTokensToRender(accessToken: String, refreshToken: String) {
-        if (RENDER_BASE_URL.contains("<YOUR-RENDER-APP>")) return
-        
-        val json = JSONObject().apply {
-            put("accessToken", accessToken)
-            put("refreshToken", refreshToken)
-        }
-
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val body = RequestBody.create(mediaType, json.toString())
-
-        val request = Request.Builder()
-            .url("$RENDER_BASE_URL/api/token")
-            .post(body)
-            .build()
-
-        client.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                showErrorOnScreen("Render 동기화 실패: ${e.message}")
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                if (!response.isSuccessful) {
-                    showErrorOnScreen("Render 동기화 에러 [코드 ${response.code}]")
-                }
-                response.body?.close()
             }
         })
     }
@@ -359,52 +257,27 @@ class MainActivity : AppCompatActivity() {
                     localStorage.setItem('tesla_access_token', '$token');
                     if (typeof window.handleOAuthCodeDirect === 'function') {
                         window.handleOAuthCodeDirect('$token', '');
-                    } else {
-                        var loginSection = document.getElementById('loginSection');
-                        var tokenSection = document.getElementById('tokenInfoSection');
-                        var displayToken = document.getElementById('displayAccessToken');
-                        
-                        if (loginSection) loginSection.classList.add('hidden');
-                        if (tokenSection) tokenSection.classList.remove('hidden');
-                        if (displayToken) displayToken.innerText = '$token';
-                        
-                        if (typeof fetchTeslaVehicles === 'function') {
-                            fetchTeslaVehicles('$token', true);
-                        }
-                        if (typeof handleRefresh === 'function') {
-                            handleRefresh(false);
-                        }
                     }
                 })();
             """.trimIndent()
-
             webView.evaluateJavascript(js, null)
         }, 500)
     }
 
-    private fun showToast(message: String) {
-        runOnUiThread {
-            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-        }
-    }
-
     override fun onDestroy() {
         super.onDestroy()
-        stopKeepAlive()
         mainActivityInstance = null
     }
 
     inner class AndroidBridge {
         @JavascriptInterface
         fun startGuardianService(accessToken: String, vehicleId: String, interval: Int, topic: String) {
-            showToast("🛡️ 가디언 시작")
-            startKeepAlive()
+            Toast.makeText(this@MainActivity, "🛡️ 가디언 시작", Toast.LENGTH_SHORT).show()
         }
 
         @JavascriptInterface
         fun stopGuardianService() {
-            showToast("🛑 가디언 중지")
-            stopKeepAlive()
+            Toast.makeText(this@MainActivity, "🛑 가디언 중지", Toast.LENGTH_SHORT).show()
         }
 
         @JavascriptInterface
@@ -417,9 +290,6 @@ class MainActivity : AppCompatActivity() {
             accessToken = token
             val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
             prefs.edit().putString("access_token", token).apply()
-            if (refreshToken.isNotEmpty()) {
-                prefs.edit().putString("refresh_token", refreshToken).apply()
-            }
         }
 
         @JavascriptInterface
@@ -427,35 +297,5 @@ class MainActivity : AppCompatActivity() {
             val prefs = getSharedPreferences("tesla_prefs", MODE_PRIVATE)
             return prefs.getString("access_token", "") ?: ""
         }
-
-        @JavascriptInterface
-        fun setVibrationPattern(pattern: String) {
-            runOnUiThread {
-                MyFirebaseMessagingService.resetNotificationChannels(this@MainActivity, pattern)
-            }
-        }
-    }
-
-    private fun startKeepAlive() {
-        if (isKeepAliveRunning) return
-        isKeepAliveRunning = true
-
-        keepAliveJob = Thread {
-            while (isKeepAliveRunning) {
-                try {
-                    val request = Request.Builder().url("$RENDER_BASE_URL/health").build()
-                    client.newCall(request).execute().close()
-                } catch (e: Exception) {
-                    showErrorOnScreen("Keep-Alive 실패: ${e.message}")
-                }
-                Thread.sleep(8 * 60 * 1000L)
-            }
-        }.apply { start() }
-    }
-
-    private fun stopKeepAlive() {
-        isKeepAliveRunning = false
-        keepAliveJob?.interrupt()
-        keepAliveJob = null
     }
 }
