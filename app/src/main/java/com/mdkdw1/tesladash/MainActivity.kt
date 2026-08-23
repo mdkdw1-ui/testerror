@@ -1,111 +1,148 @@
 package com.mdkdw1.tesladash
 
-import android.Manifest
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Bundle
-import android.provider.Settings
-import android.util.Log
-import android.webkit.*
+import android.os.Handler
+import android.os.Looper
+import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+import java.nio.ByteBuffer
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var webView: WebView
+    private lateinit var projectionManager: MediaProjectionManager
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
 
-    private val cachedHtmlContent: String by lazy {
-        try {
-            assets.open("index.html")
-                .bufferedReader(Charsets.UTF_8)
-                .use { it.readText() }
-        } catch (e: Exception) {
-            "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><h2>제2 경험치</h2><p>index.html 로딩 중 오류 발생</p></body></html>"
-        }
-    }
+    private val SCREEN_CAPTURE_REQUEST_CODE = 1000
+    private val textRecognizer = TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
 
-    companion object {
-        private const val TAG = "ExpCalculator"
-        private const val OVERLAY_PERMISSION_REQ_CODE = 1234
-    }
+    private lateinit var tvResult: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    1001
-                )
-            }
-        }
-
-        webView = WebView(this)
-        setContentView(webView)
-        
-        setupWebView()
-        checkOverlayPermission()
-
-        webView.loadDataWithBaseURL(
-            "http://localhost",
-            cachedHtmlContent,
-            "text/html",
-            "UTF-8",
-            null
-        )
+        setContentView(createDynamicLayout())
+        projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
     }
 
-    private fun setupWebView() {
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            allowFileAccess = false
-            allowContentAccess = false
-            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            setSupportZoom(true)
-            builtInZoomControls = true
-            displayZoomControls = false
-            loadWithOverviewMode = true
-            useWideViewPort = true
+    private fun createDynamicLayout(): android.view.View {
+        val layout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(50, 50, 50, 50)
         }
 
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                consoleMessage?.let {
-                    Log.d(TAG, "🌐 Console: ${it.message()}")
-                }
-                return super.onConsoleMessage(consoleMessage)
-            }
+        tvResult = TextView(this).apply {
+            text = "자동 인식 결과가 여기에 표시됩니다."
+            textSize = 18f
+            setPadding(0, 0, 0, 30)
         }
-    }
+        layout.addView(tvResult)
 
-    private fun checkOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (!Settings.canDrawOverlays(this)) {
-                val intent = Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:$packageName")
-                )
-                startActivityForResult(intent, OVERLAY_PERMISSION_REQ_CODE)
+        val btnStartCapture = Button(this).apply {
+            text = "게임 화면 자동 인식 및 계산 시작"
+            setOnClickListener {
+                val intent = projectionManager.createScreenCaptureIntent()
+                startActivityForResult(intent, SCREEN_CAPTURE_REQUEST_CODE)
             }
         }
+        layout.addView(btnStartCapture)
+
+        return layout
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == OVERLAY_PERMISSION_REQ_CODE) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                if (Settings.canDrawOverlays(this)) {
-                    Toast.makeText(this, "✅ 권한이 허용되었습니다.", Toast.LENGTH_SHORT).show()
-                }
+        if (requestCode == SCREEN_CAPTURE_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
+            if (data != null) {
+                mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+                setupVirtualDisplayAndCapture()
             }
+        } else {
+            Toast.makeText(this, "화면 캡처 권한이 거부되었습니다.", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun setupVirtualDisplayAndCapture() {
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "ScreenCapture",
+            width, height, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader?.surface, null, null
+        )
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            captureScreenAndExtractText(width, height)
+        }, 1000)
+    }
+
+    private fun captureScreenAndExtractText(width: Int, height: Int) {
+        val image = imageReader?.acquireLatestImage() ?: return
+        val planes = image.planes
+        val buffer: ByteBuffer = planes[0].buffer
+        val pixelStride = planes[0].pixelStride
+        val rowStride = planes[0].rowStride
+        val rowPadding = rowStride - pixelStride * width
+
+        var bitmap = Bitmap.createBitmap(width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888)
+        bitmap.copyPixelsFromBuffer(buffer)
+        image.close()
+
+        val cropX = 0
+        val cropY = (height * 0.6).toInt()
+        val cropWidth = (width * 0.4).toInt()
+        val cropHeight = (height * 0.4).toInt()
+
+        val croppedBitmap = Bitmap.createBitmap(bitmap, cropX, cropY, cropWidth, cropHeight)
+        bitmap.recycle()
+
+        val visionImage = InputImage.fromBitmap(croppedBitmap, 0)
+        textRecognizer.process(visionImage)
+            .addOnSuccessListener { visionText ->
+                parseNumbersAndCalculate(visionText.text)
+            }
+            .addOnFailureListener { e ->
+                tvResult.text = "OCR 인식 실패: ${e.message}"
+            }
+    }
+
+    private fun parseNumbersAndCalculate(recognizedText: String) {
+        val regex = Regex("(\\d+)\\D+(\\d+)")
+        val matchResult = regex.find(recognizedText)
+
+        if (matchResult != null) {
+            val baseExp = matchResult.groupValues[1].toInt()
+            val bonusExp = matchResult.groupValues[2].toInt()
+            val totalExp = baseExp + bonusExp
+            tvResult.text = "인식 성공!\n- 기본 경험치: $baseExp\n- 보너스 경험치: $bonusExp\n- 총 효율: $totalExp"
+        } else {
+            tvResult.text = "숫자를 찾지 못했습니다.\n인식된 텍스트: $recognizedText"
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        virtualDisplay?.release()
+        mediaProjection?.stop()
     }
 }
