@@ -46,7 +46,6 @@ class ExpCaptureService : Service() {
     private var windowManager: WindowManager? = null
     private var controlOverlayView: View? = null
     
-    // ROI 박스
     private var roiBoxView: View? = null
     private var roiLayoutParams: WindowManager.LayoutParams? = null
     private var isRoiBoxVisible = true
@@ -61,8 +60,6 @@ class ExpCaptureService : Service() {
 
     private var totalExpAccumulated: Long = 0L
     private var startTimeMs: Long = 0L
-    
-    // 이전 프레임에서 인식했던 정규화된 텍스트 시퀀스 (로그 스크롤 추적용)
     private var prevFrameNormalizedLines = listOf<String>()
 
     private lateinit var tvExpPerMin: TextView
@@ -265,8 +262,8 @@ class ExpCaptureService : Service() {
     private fun setupRoiBoxUI() {
         try {
             roiLayoutParams = WindowManager.LayoutParams(
-                650, // 초기 너비
-                240, // 초기 높이
+                650,
+                240,
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                 else
@@ -471,8 +468,8 @@ class ExpCaptureService : Service() {
             val croppedBitmap = Bitmap.createBitmap(bitmap, cropX, cropY, cropWidth, cropHeight)
             bitmap.recycle()
 
-            // 🛠️ 녹색 폰트 전용 3배 확대 & 명암 대비 전처리
-            val enhancedBitmap = enhanceGreenTextForOcr(croppedBitmap)
+            // 🛠️ 흰색/회색 로그 텍스트에 최적화된 3배 확대 및 고대비 전처리
+            val enhancedBitmap = enhanceWhiteTextForOcr(croppedBitmap)
             croppedBitmap.recycle()
 
             val visionImage = InputImage.fromBitmap(enhancedBitmap, 0)
@@ -490,30 +487,21 @@ class ExpCaptureService : Service() {
         }
     }
 
-    // 🛠️ 녹색 게임 폰트를 3배 확대하고 특화 그레이스케일 매트릭스를 적용하여 괄호/쉼표 파괴 방지
-    private fun enhanceGreenTextForOcr(src: Bitmap): Bitmap {
+    // 🛠️ 어두운 배경 위의 흰색/회색 텍스트를 선명하게 살려주는 고대비 필터
+    private fun enhanceWhiteTextForOcr(src: Bitmap): Bitmap {
         val scaledWidth = src.width * 3
         val scaledHeight = src.height * 3
         val scaled = Bitmap.createScaledBitmap(src, scaledWidth, scaledHeight, true)
 
-        // 녹색 채널(Green) 가중치 대폭 강조 (R:0.1, G:0.8, B:0.1)
+        // 대비(Contrast)를 높이고 밝기(Brightness)를 조절하여 흰 글씨를 뚜렷하게 부각
+        val contrast = 2.0f
+        val translate = -40f
         val cm = ColorMatrix(floatArrayOf(
-            0.1f, 0.8f, 0.1f, 0f, -15f,
-            0.1f, 0.8f, 0.1f, 0f, -15f,
-            0.1f, 0.8f, 0.1f, 0f, -15f,
-            0f,   0f,   0f,   1f, 0f
-        ))
-
-        // 부드러운 1.7배 대비 강조 (얇은 괄호/쉼표 손실 방지)
-        val contrast = 1.7f
-        val translate = (-0.5f * contrast + 0.5f) * 255f
-        val cmContrast = ColorMatrix(floatArrayOf(
             contrast, 0f, 0f, 0f, translate,
             0f, contrast, 0f, 0f, translate,
             0f, 0f, contrast, 0f, translate,
             0f, 0f, 0f, 1f, 0f
         ))
-        cm.postConcat(cmContrast)
 
         val result = Bitmap.createBitmap(scaledWidth, scaledHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
@@ -539,11 +527,11 @@ class ExpCaptureService : Service() {
         }
 
         if (currentNormalizedLines.isEmpty()) {
-            tvDebugOcr.text = "🔍 OCR 대기 중 (EXP 감지 안됨)"
+            val preview = rawLines.firstOrNull() ?: "(없음)"
+            tvDebugOcr.text = "🔍 감지중: $preview"
             return
         }
 
-        // 🎯 핵심 알고리즘: 이전 프레임과 비교하여 새로 올라온 스크롤 신규 라인만 정확히 필터링
         val newLines = findNewLinesByOverlap(prevFrameNormalizedLines, currentNormalizedLines)
 
         var gainedInThisBatch = 0L
@@ -561,26 +549,22 @@ class ExpCaptureService : Service() {
             totalExpAccumulated += gainedInThisBatch
             tvDebugOcr.text = "✅ 획득: $lastParsedText"
         } else {
-            tvDebugOcr.text = "🔍 감지중: ${currentNormalizedLines.last()}"
+            tvDebugOcr.text = "🔍 인식됨: ${currentNormalizedLines.last()}"
         }
 
         prevFrameNormalizedLines = currentNormalizedLines
         updateUI(gainedInThisBatch)
     }
 
-    // 1. 원본 OCR 텍스트를 표준화된 문자열 형태로 변환 (EXP +3,255(+4,224) -> EXP+3255(+4224))
     private fun normalizeLine(rawLine: String): String {
         var s = rawLine.trim()
-
-        // 천 단위 구분기호(쉼표, 마침표, 아포스트로피, 공백) 제거 -> 3,255 / 3.255 / 3 255 -> 3255
+        // 천 단위 구분기호 정규화 (3,194 -> 3194)
         s = s.replace(Regex("(?<=\\d)[.,'\\s]+(?=\\d{3}\\b)"), "")
         s = s.replace(Regex("(?<=\\d)[.,'](?=\\d)"), "")
         s = s.replace(Regex("\\s+"), "")
-
         return s.uppercase()
     }
 
-    // 경험치 관련 유효한 줄인지 판별
     private fun isExpLine(normLine: String): Boolean {
         return normLine.contains("EXP") ||
                 normLine.contains("EX") ||
@@ -589,13 +573,11 @@ class ExpCaptureService : Service() {
                 (normLine.contains("(") && normLine.contains(")"))
     }
 
-    // 2. 정규화된 문자열에서 모든 경험치 숫자(기본+보너스) 합산
     private fun extractExpFromNormalized(normLine: String): Long {
         val matches = Regex("\\d+").findAll(normLine)
         var lineSum = 0L
         for (m in matches) {
             val valLong = m.value.toLongOrNull() ?: continue
-            // 획득 경험치 범위 (10 ~ 50,000,000)
             if (valLong in 10..50000000) {
                 lineSum += valLong
             }
@@ -603,7 +585,6 @@ class ExpCaptureService : Service() {
         return lineSum
     }
 
-    // 3. 시퀀스 오버랩 알고리즘: 이전 프레임과 비교하여 새로 스크롤된 경험치 줄만 차분 추출
     private fun findNewLinesByOverlap(prev: List<String>, curr: List<String>): List<String> {
         if (prev.isEmpty()) return curr
 
